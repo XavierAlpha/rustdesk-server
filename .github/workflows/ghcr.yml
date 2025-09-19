@@ -2,6 +2,10 @@ name: Build and publish to ghcr.io
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (eg v1.2.3 or 1.2.3)'
+        required: false
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -125,12 +129,27 @@ jobs:
           images: ghcr.io/${{ env.REPOSITORY }}-s6
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -163,12 +182,27 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       # Create and push manifest for :ve.rs.ion tag
       - name: Create and push manifest (:ve.rs.ion)
@@ -258,12 +292,27 @@ jobs:
           images: ghcr.io/${{ env.REPOSITORY }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -294,12 +343,27 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       # Create and push manifest for :ve.rs.ion tag
       - name: Create and push manifest (:ve.rs.ion)
