@@ -9,6 +9,10 @@ name: build
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (eg v1.2.3 or 1.2.3)'
+        required: false
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -261,12 +265,27 @@ jobs:
           images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -300,12 +319,27 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       # manifest for :1.2.3 tag
       #  this has to run only if invoked by a new tag
@@ -384,12 +418,27 @@ jobs:
           images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE_CLASSIC }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -421,12 +470,27 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
           M=${T%%.*}
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       # manifest for :1.2.3 tag
       #  this has to run only if invoked by a new tag
