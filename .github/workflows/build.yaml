@@ -13,6 +13,10 @@ permissions:
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (eg v1.2.3 or 1.2.3)'
+        required: false
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -286,6 +290,7 @@ jobs:
           images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
@@ -293,23 +298,21 @@ jobs:
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
 
-      - name: Build and push GHCR image
-        uses: docker/build-push-action@v6
-        with:
-          context: "./docker"
-          platforms: ${{ matrix.job.docker_platform }}
-          push: true
-          provenance: false
-          build-args: |
-            S6_ARCH=${{ matrix.job.s6_platform }}
-          tags: |
-            ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
-          labels: ${{ steps.meta_ghcr.outputs.labels }}
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
 
-      - name: Build and push Docker Hub image
-        if: false
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
+
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: "./docker"
@@ -341,6 +344,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
@@ -348,13 +352,19 @@ jobs:
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
 
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       # manifest for :1.2.3 tag
       #  this has to run only if invoked by a new tag
@@ -500,6 +510,7 @@ jobs:
           images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE_CLASSIC }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
@@ -507,21 +518,21 @@ jobs:
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
 
-      - name: Build and push GHCR image
-        uses: docker/build-push-action@v6
-        with:
-          context: "./docker-classic"
-          platforms: ${{ matrix.job.docker_platform }}
-          push: true
-          provenance: false
-          tags: |
-            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
-            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
-          labels: ${{ steps.meta_ghcr_classic.outputs.labels }}
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
 
-      - name: Build and push Docker Hub image
-        if: false
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
+
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: "./docker-classic"
@@ -551,6 +562,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Get git tag
+        if: github.event_name == 'push'
         id: vars
         run: |
           T=${GITHUB_REF#refs/*/}
@@ -558,13 +570,19 @@ jobs:
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
 
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Get git tag (from manual input)
+        if: github.event_name == 'workflow_dispatch'
+        id: vars_manual
+        run: |
+          T=${{ github.event.inputs.tag }}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Show tags
+        run: |
+          echo "GIT_TAG=$GIT_TAG"
+          echo "MAJOR_TAG=$MAJOR_TAG"
 
       # manifest for :1.2.3 tag
       #  this has to run only if invoked by a new tag
