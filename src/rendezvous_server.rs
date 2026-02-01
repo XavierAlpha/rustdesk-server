@@ -708,6 +708,7 @@ impl RendezvousServer {
             relay_server: phs.relay_server.clone(),
             ..Default::default()
         };
+        p.is_udp = socket.is_some();
         if let Ok(t) = phs.nat_type.enum_value() {
             p.set_nat_type(t);
         }
