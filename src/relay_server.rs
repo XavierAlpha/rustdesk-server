@@ -24,7 +24,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::prelude::*,
     io::Error,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -404,12 +404,13 @@ async fn make_pair(
             let real_ip = headers
                 .get("X-Real-IP")
                 .or_else(|| headers.get("X-Forwarded-For"))
-                .and_then(|header_value| header_value.to_str().ok());
+                .and_then(|header_value| header_value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty());
             if let Some(ip) = real_ip {
-                if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
-                } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+                if let Ok(real_ip_addr) = ip.parse::<IpAddr>() {
+                    addr = SocketAddr::new(real_ip_addr, addr.port());
                 }
             }
             Ok(response)
@@ -622,6 +623,10 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
                     match msg {
                         tungstenite::Message::Binary(bytes) => {
                             Some(Ok(bytes[..].into())) // to-do: poor performance
+                        }
+                        tungstenite::Message::Close(_) => {
+                            log::debug!("Relay websocket close frame received");
+                            None
                         }
                         _ => Some(Ok(BytesMut::new())),
                     }
