@@ -3,7 +3,6 @@ use crate::peer::*;
 use hbb_common::sodiumoxide::crypto::{box_, secretbox};
 use hbb_common::{
     allow_err,
-    anyhow::{anyhow, Context},
     bail,
     bytes::{Bytes, BytesMut},
     config,
@@ -18,7 +17,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -71,7 +70,7 @@ static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMute
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 const HANDSHAKE_WAIT_MS: u64 = 800;
 enum HandshakeOutcome {
-    Secured,
+    Secured { key: secretbox::Key },
     Fallback { pending: Option<BytesMut> },
 }
 
@@ -543,6 +542,11 @@ impl RendezvousServer {
                 msg_out.set_test_nat_response(res);
                 Self::send_to_sink(sink, msg_out).await;
             }
+            Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                let msg_out = self.build_online_response(&or.peers).await;
+                Self::send_to_sink(sink, msg_out).await;
+                return true;
+            }
             Some(rendezvous_message::Union::KeyExchange(_)) => {
                 log::debug!("Ignore KeyExchange on message path");
                 return true;
@@ -866,10 +870,17 @@ impl RendezvousServer {
 
     #[inline]
     async fn handle_online_request(
-        &mut self,
+        &self,
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
+        let msg_out = self.build_online_response(&peers).await;
+        stream.send(&msg_out).await?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn build_online_response(&self, peers: &[String]) -> RendezvousMessage {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
@@ -888,9 +899,7 @@ impl RendezvousServer {
             states: states.into(),
             ..Default::default()
         });
-        stream.send(&msg_out).await?;
-
-        Ok(())
+        msg_out
     }
 
     #[inline]
@@ -1313,15 +1322,117 @@ impl RendezvousServer {
 
                 let mut sb = [0u8; secretbox::KEYBYTES];
                 sb.copy_from_slice(&symmetric);
-                stream.set_key(secretbox::Key(sb));
+                let key = secretbox::Key(sb);
+                stream.set_key(key.clone());
                 log::info!("Connection secured");
-                HandshakeOutcome::Secured
+                HandshakeOutcome::Secured { key }
             }
             Some(Err(e)) => {
                 log::debug!("Handshake wait read error: {}", e);
                 HandshakeOutcome::Fallback { pending: None }
             }
             None => {
+                log::debug!("Handshake wait timeout");
+                HandshakeOutcome::Fallback { pending: None }
+            }
+        }
+    }
+
+    async fn attempt_handshake_ws(
+        &self,
+        ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    ) -> HandshakeOutcome {
+        let Some(sk) = self.inner.sk.as_ref() else {
+            return HandshakeOutcome::Fallback { pending: None };
+        };
+
+        let (tmp_pk, tmp_sk) = box_::gen_keypair();
+        let signed_pk = sign::sign(&tmp_pk.0, sk);
+
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_key_exchange(KeyExchange {
+            keys: vec![signed_pk.into()],
+            ..Default::default()
+        });
+
+        let Ok(bytes) = msg_out.write_to_bytes() else {
+            return HandshakeOutcome::Fallback { pending: None };
+        };
+        if let Err(e) = ws.send(tungstenite::Message::Binary(bytes)).await {
+            log::debug!("Send KeyExchange failed: {}", e);
+            return HandshakeOutcome::Fallback { pending: None };
+        }
+
+        let res = timeout(HANDSHAKE_WAIT_MS, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(tungstenite::Message::Binary(bytes))) => return Ok(Some(bytes)),
+                    Some(Ok(tungstenite::Message::Close(_))) => return Ok(None),
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => return Err(e),
+                    None => return Ok(None),
+                }
+            }
+        })
+        .await;
+
+        match res {
+            Ok(Ok(Some(bytes))) => {
+                let bytes_mut = BytesMut::from(&bytes[..]);
+                let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes_mut[..]) else {
+                    return HandshakeOutcome::Fallback {
+                        pending: Some(bytes_mut),
+                    };
+                };
+                let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union else {
+                    return HandshakeOutcome::Fallback {
+                        pending: Some(bytes_mut),
+                    };
+                };
+                if ex.keys.len() != 2 || ex.keys[0].len() != box_::PUBLICKEYBYTES {
+                    return HandshakeOutcome::Fallback {
+                        pending: Some(bytes_mut),
+                    };
+                }
+
+                let Some(client_pk) = box_::PublicKey::from_slice(&ex.keys[0]) else {
+                    log::warn!("Handshake failed: client pk parse");
+                    return HandshakeOutcome::Fallback {
+                        pending: Some(bytes_mut),
+                    };
+                };
+
+                let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+                let Ok(symmetric) = box_::open(ex.keys[1].as_ref(), &nonce, &client_pk, &tmp_sk)
+                else {
+                    log::warn!("Handshake failed: box decryption failure");
+                    return HandshakeOutcome::Fallback {
+                        pending: Some(bytes_mut),
+                    };
+                };
+
+                if symmetric.len() != secretbox::KEYBYTES {
+                    log::warn!(
+                        "Handshake failed: invalid symmetric key length {}",
+                        symmetric.len()
+                    );
+                    return HandshakeOutcome::Fallback {
+                        pending: Some(bytes_mut),
+                    };
+                }
+
+                let mut sb = [0u8; secretbox::KEYBYTES];
+                sb.copy_from_slice(&symmetric);
+                let key = secretbox::Key(sb);
+                log::info!("Connection secured");
+                HandshakeOutcome::Secured { key }
+            }
+            Ok(Ok(None)) => HandshakeOutcome::Fallback { pending: None },
+            Ok(Err(e)) => {
+                log::debug!("Handshake wait read error: {}", e);
+                HandshakeOutcome::Fallback { pending: None }
+            }
+            Err(_) => {
                 log::debug!("Handshake wait timeout");
                 HandshakeOutcome::Fallback { pending: None }
             }
@@ -1344,31 +1455,57 @@ impl RendezvousServer {
                 let real_ip = headers
                     .get("X-Real-IP")
                     .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
+                    .and_then(|header_value| header_value.to_str().ok())
+                    .and_then(|value| value.split(',').next())
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty());
                 if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+                    if let Ok(real_ip_addr) = ip.parse::<IpAddr>() {
+                        // Keep the accepted TCP source port to avoid key collisions for
+                        // concurrent websocket clients from the same public IP.
+                        addr = SocketAddr::new(real_ip_addr, addr.port());
                     }
                 }
                 Ok(response)
             };
-            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            let mut ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+
+            let (ws_key, pending_first_frame) = match self.attempt_handshake_ws(&mut ws_stream).await
+            {
+                HandshakeOutcome::Secured { key } => (Some(key), None),
+                HandshakeOutcome::Fallback { pending } => (None, pending),
+            };
+
             let (mut ws_sink, mut ws_stream) = ws_stream.split();
+            let (mut ws_encrypt_in, ws_encrypt_out) = match ws_key {
+                Some(key) => {
+                    let secretbox::Key(bytes) = key;
+                    (
+                        Some(Encrypt::new(secretbox::Key(bytes))),
+                        Some(Encrypt::new(secretbox::Key(bytes))),
+                    )
+                }
+                None => (None, None),
+            };
 
             // bridge a rendezvous message channel to websocket sink (binary)
             let (tx, mut rx) = mpsc::unbounded_channel::<RendezvousMessage>();
             let forward = async move {
+                let mut ws_encrypt_out = ws_encrypt_out;
                 while let Some(msg) = rx.recv().await {
                     if let Ok(bytes) = msg.write_to_bytes() {
+                        let bytes = if let Some(enc) = ws_encrypt_out.as_mut() {
+                            enc.enc(&bytes)
+                        } else {
+                            bytes
+                        };
                         if ws_sink.send(tungstenite::Message::Binary(bytes)).await.is_err() {
                             break;
                         }
                     }
                 }
             };
-            tokio::spawn(forward);
+            let forward_task = tokio::spawn(forward);
 
             sink = Some(Sink::Tcp(tx.clone()));
             self.tcp_punch
@@ -1376,13 +1513,44 @@ impl RendezvousServer {
                 .await
                 .insert(try_into_v4(addr), Sink::Tcp(tx));
 
-            while let Ok(Some(Ok(msg))) = timeout(30_000, ws_stream.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
-                    }
+            if let Some(bytes) = pending_first_frame {
+                if !bytes.is_empty() && !self.handle_tcp(bytes.as_ref(), &mut sink, addr, key, ws).await
+                {
+                    self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+                    forward_task.abort();
+                    log::debug!(
+                        "WebSocket connection from {:?} closed during first-frame handling",
+                        addr
+                    );
+                    return Ok(());
                 }
             }
+
+            while let Ok(Some(Ok(msg))) = timeout(30_000, ws_stream.next()).await {
+                match msg {
+                    tungstenite::Message::Binary(bytes) => {
+                        let mut bytes = BytesMut::from(&bytes[..]);
+                        if let Some(enc) = ws_encrypt_in.as_mut() {
+                            if let Err(err) = enc.dec(&mut bytes) {
+                                log::debug!("WebSocket decrypt error from {}: {}", addr, err);
+                                break;
+                            }
+                        }
+                        if bytes.is_empty() {
+                            continue; // heartbeat / keep-alive
+                        }
+                        if !self.handle_tcp(bytes.as_ref(), &mut sink, addr, key, ws).await {
+                            break;
+                        }
+                    }
+                    tungstenite::Message::Close(_) => {
+                        log::debug!("WebSocket close from {}", addr);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            forward_task.abort();
         } else {
             // If a secret key is configured, the server is in encryption mode.
             // It must proactively send a KeyExchange message to the client
@@ -1391,7 +1559,7 @@ impl RendezvousServer {
             let mut stream = FramedStream::from(stream, addr);
 
             let pending_first_frame = match self.attempt_handshake(&mut stream).await {
-                HandshakeOutcome::Secured => None,
+                HandshakeOutcome::Secured { .. } => None,
                 HandshakeOutcome::Fallback { pending } => pending,
             };
 
@@ -1406,16 +1574,12 @@ impl RendezvousServer {
             if let Some(bytes) = pending_first_frame {
                 let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) else {
                     log::warn!("Failed to parse first RendezvousMessage from {}", addr);
-                    if sink.is_none() {
-                        self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-                    }
+                    self.tcp_punch.lock().await.remove(&try_into_v4(addr));
                     log::debug!("Tcp connection from {:?} closed (bad first frame)", addr);
                     return Ok(());
                 };
                 if !self.handle_tcp_msg(msg_in, &mut sink, addr, key, ws).await {
-                    if sink.is_none() {
-                        self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-                    }
+                    self.tcp_punch.lock().await.remove(&try_into_v4(addr));
                     log::debug!(
                         "Tcp connection from {:?} closed after first-frame handling",
                         addr
@@ -1462,9 +1626,7 @@ impl RendezvousServer {
             }
         }
 
-        if sink.is_none() {
-            self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        }
+        self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
     }
