@@ -1660,7 +1660,6 @@ dependencies = [
  "mac_address",
  "machine-uid 0.2.0",
  "minreq",
- "native-tls",
  "once_cell",
  "openssl",
  "ping",

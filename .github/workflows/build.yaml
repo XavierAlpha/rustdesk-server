@@ -6,9 +6,10 @@ name: build
 # DOCKER_IMAGE_CLASSIC should be the target image name on docker hub for the old build (e.g. "rustdesk/rustdesk-server" )
 # DOCKER_USERNAME is the username you normally use to login at https://hub.docker.com/
 # DOCKER_PASSWORD is a token you should create under "account settings / security" with read/write access
+# Docker Hub publishing is currently disabled with `if: false`; keep those steps only for easy re-enable later.
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 on:
@@ -19,10 +20,8 @@ on:
         required: false
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
+      - 'v*.*.*'
+      - '*.*.*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,7 +52,7 @@ jobs:
     steps:
       
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -80,7 +79,7 @@ jobs:
         run: chmod -v a+x target/${{ matrix.job.target }}/release/*
 
       - name: Publish Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binaries-linux-${{ matrix.job.name }}
           path: |
@@ -96,7 +95,7 @@ jobs:
     steps:
       
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -117,18 +116,14 @@ jobs:
         with:
           command: build
           args: --release --all-features --target=x86_64-pc-windows-msvc
-          use-cross: true
 
       - name: Install NSIS
         run: |
-          iwr -useb get.scoop.sh -outfile 'install.ps1'
-          .\install.ps1 -RunAsAdmin
-          scoop update
-          scoop bucket add extras
-          scoop install nsis
+          choco install nsis -y --no-progress
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files (x86)\NSIS'
 
       - name: Install Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: 22
 
@@ -172,7 +167,7 @@ jobs:
           recursive: false
 
       - name: Publish Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binaries-windows-x86_64
           path: |
@@ -186,6 +181,7 @@ jobs:
   release:
 
     name: Github release
+    if: github.ref_type == 'tag' || github.event.inputs.tag != ''
     needs: 
       - build
       - build-win
@@ -204,7 +200,7 @@ jobs:
     steps:
 
       - name: Download binaries (${{ matrix.job.os }} - ${{ matrix.job.name }})
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: binaries-${{ matrix.job.os }}-${{ matrix.job.name }}
           path: ${{ matrix.job.name }}
@@ -218,16 +214,18 @@ jobs:
           DEBIAN_FRONTEND=noninteractive sudo apt install -y zip
           zip ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip ${{ matrix.job.name }}/*
 
-      - name: Create Release (${{ matrix.job.os }} - (${{ matrix.job.name }})
+      - name: Create Release (${{ matrix.job.os }} - ${{ matrix.job.name }})
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           files: ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip
             
   # docker build and push of single-arch images
   docker:
 
-    name: Docker push - ${{ matrix.job.name }}
+    name: GHCR push (s6) - ${{ matrix.job.name }}
+    if: github.ref_type == 'tag' || github.event.inputs.tag != ''
     needs: build
     runs-on: ubuntu-24.04
     strategy:
@@ -242,12 +240,12 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           submodules: recursive
         
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: binaries-linux-${{ matrix.job.name }}
           path: docker/rootfs/usr/bin
@@ -262,14 +260,13 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: false && github.event_name != 'pull_request'
+        if: false
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -312,7 +309,7 @@ jobs:
           echo "GIT_TAG=$GIT_TAG"
           echo "MAJOR_TAG=$MAJOR_TAG"
 
-      - name: Build and push Docker image
+      - name: Build and push GHCR image
         uses: docker/build-push-action@v6
         with:
           context: "./docker"
@@ -322,26 +319,34 @@ jobs:
           build-args: |
             S6_ARCH=${{ matrix.job.s6_platform }}
           tags: |
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
-          labels: ${{ steps.meta_docker.outputs.labels }}
+            ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
+          labels: ${{ steps.meta_ghcr.outputs.labels }}
 
   # docker build and push of multiarch images
   docker-manifest:
 
-    name: Docker manifest
+    name: GHCR manifest (s6)
+    if: github.ref_type == 'tag' || github.event.inputs.tag != ''
     needs: docker
     runs-on: ubuntu-24.04
 
     steps:
 
       - name: Log in to Docker Hub
-        if: false && github.event_name != 'pull_request'
+        if: false
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get git tag
         if: github.event_name == 'push'
@@ -370,7 +375,7 @@ jobs:
       #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@v1
-        if: false && github.event_name != 'workflow_dispatch'
+        if: false
         with:
           tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}
           inputs: |
@@ -410,7 +415,6 @@ jobs:
       # manifest for :1.2.3 tag
       - name: Create and push GHCR manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@v1
-        if: github.event_name != 'workflow_dispatch'
         with:
           tags: ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}
           inputs: |
@@ -447,7 +451,8 @@ jobs:
   # docker build and push of single-arch images
   docker-classic:
 
-    name: Docker push - ${{ matrix.job.name }}
+    name: GHCR push (classic) - ${{ matrix.job.name }}
+    if: github.ref_type == 'tag' || github.event.inputs.tag != ''
     needs: build
     runs-on: ubuntu-24.04
     strategy:
@@ -462,12 +467,12 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           submodules: recursive
         
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: binaries-linux-${{ matrix.job.name }}
           path: docker-classic/
@@ -482,14 +487,13 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: false && github.event_name != 'pull_request'
+        if: false
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -532,7 +536,7 @@ jobs:
           echo "GIT_TAG=$GIT_TAG"
           echo "MAJOR_TAG=$MAJOR_TAG"
 
-      - name: Build and push Docker image
+      - name: Build and push GHCR image
         uses: docker/build-push-action@v6
         with:
           context: "./docker-classic"
@@ -540,26 +544,34 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
-            ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
-          labels: ${{ steps.meta_docker_classic.outputs.labels }}
+            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
+          labels: ${{ steps.meta_ghcr_classic.outputs.labels }}
 
   # docker build and push of multiarch images
   docker-manifest-classic:
 
-    name: Docker manifest
+    name: GHCR manifest (classic)
+    if: github.ref_type == 'tag' || github.event.inputs.tag != ''
     needs: docker-classic
     runs-on: ubuntu-24.04
 
     steps:
 
       - name: Log in to Docker Hub
-        if: false && github.event_name != 'pull_request'
+        if: false
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get git tag
         if: github.event_name == 'push'
@@ -588,7 +600,7 @@ jobs:
       #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@v1
-        if: false && github.event_name != 'workflow_dispatch'
+        if: false
         with:
           tags: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
           inputs: |
@@ -628,7 +640,6 @@ jobs:
       # manifest for :1.2.3 tag
       - name: Create and push GHCR manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@v1
-        if: github.event_name != 'workflow_dispatch'
         with:
           tags: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
           inputs: |
@@ -680,7 +691,7 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -694,7 +705,7 @@ jobs:
           mkdir -p debian-build/${{ matrix.job.name }}/bin
 
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: binaries-linux-${{ matrix.job.name }}
           path: debian-build/${{ matrix.job.name }}/bin
@@ -708,9 +719,11 @@ jobs:
           debuild -i -us -uc -b -a${{ matrix.job.debian_platform }}
 
       - name: Create Release
+        if: github.ref_type == 'tag' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           files: |
             debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
             debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
