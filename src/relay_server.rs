@@ -50,8 +50,10 @@ pub async fn start_with_bind(
     bind_addr: Option<IpAddr>,
     port: &str,
     key: &str,
+    trust_proxy_headers: bool,
 ) -> ResultType<()> {
     let key = get_server_sk(key);
+    log::info!("trust_proxy_headers: {}", trust_proxy_headers);
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -94,6 +96,7 @@ pub async fn start_with_bind(
                 crate::common::listen_tcp(bind_addr, port2).await?,
                 crate::common::listen_console(bind_addr, port).await?,
                 &key,
+                trust_proxy_headers,
             )
             .await;
         }
@@ -338,6 +341,7 @@ async fn io_loop(
     listener2: TcpListener,
     listener_console: Option<TcpListener>,
     key: &str,
+    trust_proxy_headers: bool,
 ) {
     check_params();
     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
@@ -347,7 +351,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, false).await;
+                        handle_connection(stream, addr, &limiter, key, false, trust_proxy_headers).await;
                     }
                     Err(err) => {
                        log::error!("listener.accept failed: {}", err);
@@ -359,7 +363,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, true).await;
+                        handle_connection(stream, addr, &limiter, key, true, trust_proxy_headers).await;
                     }
                     Err(err) => {
                        log::error!("listener2.accept failed: {}", err);
@@ -389,6 +393,7 @@ async fn handle_connection(
     limiter: &Limiter,
     key: &str,
     ws: bool,
+    trust_proxy_headers: bool,
 ) {
     let ip = hbb_common::try_into_v4(addr).ip();
     if !ws && ip.is_loopback() {
@@ -399,7 +404,7 @@ async fn handle_connection(
             if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                 if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                     let res = check_cmd(data, limiter).await;
-                    stream.write(res.as_bytes()).await.ok();
+                    stream.write_all(res.as_bytes()).await.ok();
                 }
             }
         });
@@ -413,7 +418,7 @@ async fn handle_connection(
     let key = key.to_owned();
     let limiter = limiter.clone();
     tokio::spawn(async move {
-        allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
+        allow_err!(make_pair(stream, addr, &key, limiter, ws, trust_proxy_headers).await);
     });
 }
 
@@ -423,29 +428,32 @@ async fn make_pair(
     key: &str,
     limiter: Limiter,
     ws: bool,
+    trust_proxy_headers: bool,
 ) -> ResultType<()> {
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let callback = |req: &Request, response: Response| {
-            let headers = req.headers();
-            // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
-            // client IP is preserved when the WebSocket port runs behind a
-            // reverse proxy (WSS). They are NOT validated: anyone who can reach
-            // this port directly can spoof an arbitrary IP, bypassing IP-based
-            // rate limiting / blocking and corrupting logged IPs. Do not expose
-            // the WebSocket port directly to untrusted networks; only the
-            // reverse proxy, which overwrites these headers, should be able to
-            // connect to it.
-            // https://github.com/rustdesk/rustdesk-server/issues/634
-            let real_ip = headers
-                .get("X-Real-IP")
-                .or_else(|| headers.get("X-Forwarded-For"))
-                .and_then(|header_value| header_value.to_str().ok());
-            if let Some(ip) = real_ip {
-                if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
-                } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+            if trust_proxy_headers {
+                // Only consulted when the operator opts in with --trust-proxy-headers.
+                // These headers are NOT verifiable: anyone able to reach this port
+                // directly can spoof an arbitrary IP, bypassing IP-based rate limiting
+                // and corrupting logged addresses. Enable it only when the WebSocket
+                // port is reachable exclusively through a reverse proxy that overwrites
+                // them. https://github.com/rustdesk/rustdesk-server/issues/634
+                let headers = req.headers();
+                let real_ip = headers
+                    .get("X-Real-IP")
+                    .or_else(|| headers.get("X-Forwarded-For"))
+                    .and_then(|header_value| header_value.to_str().ok())
+                    .and_then(|value| value.split(',').next())
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty());
+                if let Some(ip) = real_ip {
+                    if let Ok(real_ip_addr) = ip.parse::<IpAddr>() {
+                        // Keep the accepted TCP source port so concurrent websocket
+                        // clients behind one public IP stay distinguishable.
+                        addr = SocketAddr::new(real_ip_addr, addr.port());
+                    }
                 }
             }
             Ok(response)
@@ -659,10 +667,14 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
                         tungstenite::Message::Binary(bytes) => {
                             Some(Ok(bytes[..].into())) // to-do: poor performance
                         }
+                        tungstenite::Message::Close(_) => {
+                            log::debug!("Relay websocket close frame received");
+                            None
+                        }
                         _ => Some(Ok(BytesMut::new())),
                     }
                 }
-                Err(err) => Some(Err(Error::new(std::io::ErrorKind::Other, err.to_string()))),
+                Err(err) => Some(Err(Error::other(err.to_string()))),
             }
         } else {
             None

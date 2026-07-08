@@ -18,6 +18,7 @@ fn main() -> ResultType<()> {
         "-b, --bind=[IP] 'Sets the IP address to bind to (default: all interfaces)'
         -p, --port=[NUMBER(default={RELAY_PORT})] 'Sets the listening port'
         -k, --key=[KEY] 'Only allow the client with the same key'
+        , --trust-proxy-headers=[Y/N] 'Trust X-Real-IP/X-Forwarded-For on websocket listeners'
         ",
     );
     let matches = App::new("hbbr")
@@ -51,6 +52,11 @@ fn main() -> ResultType<()> {
         bind_addr,
         matches.value_of("port").unwrap_or(&port.to_string()),
         &key,
+        matches
+            .value_of("trust-proxy-headers")
+            .map(str::to_owned)
+            .unwrap_or_else(|| common::get_arg("TRUST_PROXY_HEADERS"))
+            .eq_ignore_ascii_case("Y"),
     )?;
     Ok(())
 }

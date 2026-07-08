@@ -74,6 +74,14 @@ spec:
       port: 21117
       targetPort: 21117
       protocol: TCP
+    - name: hbbs-ws
+      port: 21118
+      targetPort: 21118
+      protocol: TCP
+    - name: hbbr-ws
+      port: 21119
+      targetPort: 21119
+      protocol: TCP
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
