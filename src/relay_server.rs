@@ -376,7 +376,9 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, false).await;
+                        // The console listener never speaks WebSocket, so proxy
+                        // headers are never consulted for it.
+                        handle_connection(stream, addr, &limiter, key, false, false).await;
                     }
                     Err(err) => {
                        log::error!("console listener.accept failed: {}", err);

@@ -14,7 +14,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, Encrypt, FramedStream},
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -417,10 +417,10 @@ impl RendezvousServer {
                     // UDP PunchHoleRequest is intentionally unsupported.
                     // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
-                Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
+                Some(rendezvous_message::Union::PunchHoleSent(_)) => {
                     // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
                 }
-                Some(rendezvous_message::Union::LocalAddr(la)) => {
+                Some(rendezvous_message::Union::LocalAddr(_)) => {
                     // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
