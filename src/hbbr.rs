@@ -1,4 +1,4 @@
-use clap::App;
+use clap::{Arg, Command};
 mod common;
 mod relay_server;
 use flexi_logger::*;
@@ -14,18 +14,37 @@ fn main() -> ResultType<()> {
         .format(opt_format)
         .write_mode(WriteMode::Async)
         .start()?;
-    let args = format!(
-        "-b, --bind=[IP] 'Sets the IP address to bind to (default: all interfaces)'
-        -p, --port=[NUMBER(default={RELAY_PORT})] 'Sets the listening port'
-        -k, --key=[KEY] 'Only allow the client with the same key'
-        , --trust-proxy-headers=[Y/N] 'Trust X-Real-IP/X-Forwarded-For on websocket listeners'
-        ",
-    );
-    let matches = App::new("hbbr")
+    let matches = Command::new("hbbr")
         .version(version::VERSION)
         .author("Purslane Ltd. <info@rustdesk.com>")
         .about("RustDesk Relay Server")
-        .args_from_usage(&args)
+        .arg(
+            Arg::new("bind")
+                .short('b')
+                .long("bind")
+                .value_name("IP")
+                .help("Sets the IP address to bind to (default: all interfaces)"),
+        )
+        .arg(
+            Arg::new("port")
+                .short('p')
+                .long("port")
+                .value_name(format!("NUMBER(default={RELAY_PORT})"))
+                .help("Sets the listening port"),
+        )
+        .arg(
+            Arg::new("key")
+                .short('k')
+                .long("key")
+                .value_name("KEY")
+                .help("Only allow the client with the same key"),
+        )
+        .arg(
+            Arg::new("trust-proxy-headers")
+                .long("trust-proxy-headers")
+                .value_name("Y/N")
+                .help("Trust X-Real-IP/X-Forwarded-For on websocket listeners"),
+        )
         .get_matches();
     if let Ok(v) = ini::Ini::load_from_file(".env") {
         if let Some(section) = v.section(None::<String>) {
@@ -39,24 +58,28 @@ fn main() -> ResultType<()> {
             port = v + 1;
         }
     }
+    let default_port = port.to_string();
     let bind = matches
-        .value_of("bind")
-        .map(str::to_owned)
+        .get_one::<String>("bind")
+        .map(String::to_owned)
         .unwrap_or_else(|| common::get_arg("BIND"));
     let bind_addr = common::parse_bind_address(&bind)?;
     let key = matches
-        .value_of("key")
-        .map(str::to_owned)
+        .get_one::<String>("key")
+        .map(String::to_owned)
         .unwrap_or_else(|| common::get_arg("KEY"));
+    let trust_proxy_headers = matches
+        .get_one::<String>("trust-proxy-headers")
+        .map(String::to_owned)
+        .unwrap_or_else(|| common::get_arg("TRUST_PROXY_HEADERS"));
     start_with_bind(
         bind_addr,
-        matches.value_of("port").unwrap_or(&port.to_string()),
-        &key,
         matches
-            .value_of("trust-proxy-headers")
-            .map(str::to_owned)
-            .unwrap_or_else(|| common::get_arg("TRUST_PROXY_HEADERS"))
-            .eq_ignore_ascii_case("Y"),
+            .get_one::<String>("port")
+            .map(String::as_str)
+            .unwrap_or(&default_port),
+        &key,
+        trust_proxy_headers.eq_ignore_ascii_case("Y"),
     )?;
     Ok(())
 }

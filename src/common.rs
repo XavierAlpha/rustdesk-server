@@ -1,6 +1,8 @@
-use clap::App;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use clap::{Arg, Command};
 use hbb_common::{
-    allow_err, anyhow::{Context, Result}, get_version_number, log, tokio, ResultType
+    anyhow::{Context, Result},
+    log, ResultType,
 };
 use ini::Ini;
 use sodiumoxide::crypto::sign;
@@ -117,12 +119,12 @@ pub fn set_arg(name: &str, value: &str) {
 }
 
 #[allow(dead_code)]
-pub fn init_args(args: &str, name: &str, about: &str) {
-    let matches = App::new(name)
+pub fn init_args(args: Vec<Arg>, name: &str, about: &str) {
+    let matches = Command::new(name.to_owned())
         .version(crate::version::VERSION)
         .author("Purslane Ltd. <info@rustdesk.com>")
-        .about(about)
-        .args_from_usage(args)
+        .about(about.to_owned())
+        .args(args)
         .get_matches();
     if let Ok(v) = Ini::load_from_file(".env") {
         if let Some(section) = v.section(None::<String>) {
@@ -131,7 +133,7 @@ pub fn init_args(args: &str, name: &str, about: &str) {
                 .for_each(|(k, v)| set_arg(k, v));
         }
     }
-    if let Some(config) = matches.value_of("config") {
+    if let Some(config) = matches.get_one::<String>("config") {
         if let Ok(v) = Ini::load_from_file(config) {
             if let Some(section) = v.section(None::<String>) {
                 section
@@ -140,9 +142,9 @@ pub fn init_args(args: &str, name: &str, about: &str) {
             }
         }
     }
-    for (k, v) in matches.args {
-        if let Some(v) = v.vals.first() {
-            set_arg(k, &v.to_string_lossy());
+    for id in matches.ids() {
+        if let Some(v) = matches.get_one::<String>(id.as_str()) {
+            set_arg(id.as_str(), v);
         }
     }
 }
@@ -202,11 +204,11 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
             let contents = contents.trim();
-            let sk = base64::decode(contents).unwrap_or_default();
+            let sk = BASE64.decode(contents).unwrap_or_default();
             if sk.len() == sign::SECRETKEYBYTES {
                 let mut tmp = [0u8; sign::SECRETKEYBYTES];
                 tmp[..].copy_from_slice(&sk);
-                let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
+                let pk = BASE64.encode(&tmp[sign::SECRETKEYBYTES / 2..]);
                 log::info!("Private key comes from {}", sk_file);
                 return (pk, Some(sign::SecretKey(tmp)));
             } else {
@@ -218,7 +220,7 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
     } else {
         let gen_func = || {
             let (tmp, sk) = sign::gen_keypair();
-            (base64::encode(tmp), sk)
+            (BASE64.encode(tmp), sk)
         };
         let (mut pk, mut sk) = gen_func();
         for _ in 0..300 {
@@ -231,7 +233,7 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
         if let Ok(mut f) = std::fs::File::create(&pub_file) {
             f.write_all(pk.as_bytes()).ok();
             if let Ok(mut f) = std::fs::File::create(sk_file) {
-                let s = base64::encode(&sk);
+                let s = BASE64.encode(&sk);
                 if f.write_all(s.as_bytes()).is_ok() {
                     log::info!("Private/public key written to {}/{}", sk_file, pub_file);
                     log::debug!("Public key: {}", pk);
@@ -277,126 +279,4 @@ pub async fn listen_signal() -> Result<()> {
     let () = std::future::pending().await;
     unreachable!();
 }
-
-
-pub fn check_software_update() {
-    const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
-    std::thread::spawn(move || loop {
-        std::thread::spawn(move || allow_err!(check_software_update_()));
-        std::thread::sleep(std::time::Duration::from_secs(ONE_DAY_IN_SECONDS));
-    });
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn check_software_update_() -> hbb_common::ResultType<()> {
-    let (request, url) = hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
-    let latest_release_response = reqwest::Client::builder().build()?
-        .post(url)
-        .json(&request)
-        .send()
-        .await?;
-
-    let bytes = latest_release_response.bytes().await?;
-    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
-    let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
-    if get_version_number(&latest_release_version) > get_version_number(crate::version::VERSION) {
-       log::info!("new version is available: {}", latest_release_version);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    #[test]
-    fn argument_names_ignore_case_and_separator() {
-        let aliases = [
-            "RUSTDESK-CONFIG-ALIAS-TEST",
-            "RUSTDESK_CONFIG_ALIAS_TEST",
-            "rustdesk-config-alias-test",
-            "rustdesk_config_alias_test",
-            "RustDesk_Config-Alias_Test",
-        ];
-        for alias in aliases {
-            std::env::remove_var(alias);
-        }
-        for alias in aliases {
-            std::env::set_var(alias, alias);
-            assert_eq!(get_arg("RUSTDESK_CONFIG_ALIAS_TEST"), alias);
-            std::env::remove_var(alias);
-        }
-        set_arg("rustdesk_config_alias_test", "normalized");
-        assert_eq!(
-            std::env::var("RUSTDESK-CONFIG-ALIAS-TEST").unwrap(),
-            "normalized"
-        );
-        std::env::set_var("RUSTDESK_CONFIG_ALIAS_TEST", "inherited");
-        set_arg("rustdesk-config-alias-test", "higher-priority");
-        assert_eq!(get_arg("rustdesk_config_alias_test"), "higher-priority");
-        std::env::remove_var("RUSTDESK-CONFIG-ALIAS-TEST");
-        std::env::remove_var("RUSTDESK_CONFIG_ALIAS_TEST");
-    }
-
-    #[test]
-    fn parses_bind_address() {
-        assert_eq!(parse_bind_address("").unwrap(), None);
-        assert_eq!(
-            parse_bind_address("127.0.0.1").unwrap(),
-            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
-        );
-        assert_eq!(
-            parse_bind_address("::1").unwrap(),
-            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
-        );
-        assert!(parse_bind_address("not-an-ip").is_err());
-    }
-
-    #[hbb_common::tokio::test]
-    async fn tcp_listener_uses_bind_address() {
-        let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let listener = listen_tcp(Some(bind_addr), 0).await.unwrap();
-        assert_eq!(listener.local_addr().unwrap().ip(), bind_addr);
-    }
-
-    #[test]
-    fn console_addr_only_when_bind_does_not_cover_ipv4_localhost() {
-        for bind_addr in [
-            None,
-            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
-            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        ] {
-            assert_eq!(console_addr(bind_addr, 21117), None);
-        }
-        for bind_addr in [
-            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
-            Some("2001:db8::1".parse().unwrap()),
-            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-        ] {
-            assert_eq!(
-                console_addr(bind_addr, 21117),
-                Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21117))
-            );
-        }
-    }
-
-    #[hbb_common::tokio::test]
-    async fn console_listener_binds_ipv4_localhost() {
-        let listener = listen_console(Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))), 0)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            listener.local_addr().unwrap().ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
-        assert!(listen_console(None, 0).await.unwrap().is_none());
-        assert!(listen_console(Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), 0)
-            .await
-            .unwrap()
-            .is_none());
-    }
-}

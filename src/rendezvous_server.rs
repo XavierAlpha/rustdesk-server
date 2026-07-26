@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use hbb_common::sodiumoxide::crypto::{box_, secretbox};
 use hbb_common::{
     allow_err, bail,
@@ -1545,7 +1546,7 @@ impl RendezvousServer {
         let Ok(bytes) = msg_out.write_to_bytes() else {
             return HandshakeOutcome::Fallback { pending: None };
         };
-        if let Err(e) = ws.send(tungstenite::Message::Binary(bytes)).await {
+        if let Err(e) = ws.send(tungstenite::Message::Binary(bytes.into())).await {
             log::debug!("Send KeyExchange failed: {}", e);
             return HandshakeOutcome::Fallback { pending: None };
         }
@@ -1696,7 +1697,7 @@ impl RendezvousServer {
                             bytes
                         };
                         if ws_sink
-                            .send(tungstenite::Message::Binary(bytes))
+                            .send(tungstenite::Message::Binary(bytes.into()))
                             .await
                             .is_err()
                         {
@@ -1869,10 +1870,10 @@ impl RendezvousServer {
     fn get_server_sk(key: &str) -> (String, Option<sign::SecretKey>) {
         let mut out_sk = None;
         let mut key = key.to_owned();
-        if let Ok(sk) = base64::decode(&key) {
+        if let Ok(sk) = BASE64.decode(&key) {
             if sk.len() == sign::SECRETKEYBYTES {
                 log::info!("The key is a crypto private key");
-                key = base64::encode(&sk[(sign::SECRETKEYBYTES / 2)..]);
+                key = BASE64.encode(&sk[(sign::SECRETKEYBYTES / 2)..]);
                 let mut tmp = [0u8; sign::SECRETKEYBYTES];
                 tmp[..].copy_from_slice(&sk);
                 out_sk = Some(sign::SecretKey(tmp));
