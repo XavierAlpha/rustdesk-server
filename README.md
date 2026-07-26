@@ -1,59 +1,66 @@
-# RustDesk Server Program
+# Camellia Server
 
-[![build](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml)
+Camellia's self-hosted ID/rendezvous and relay servers, a fork of
+[rustdesk-server](https://github.com/rustdesk/rustdesk-server).
 
-[**Download**](https://github.com/rustdesk/rustdesk-server/releases)
-
-[**Manual**](https://rustdesk.com/docs/en/self-host/)
-
-[**Configuration & environment variables**](docs/environment-variables.md)
-
-[**FAQ**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
-
-[**How to migrate OSS to Pro**](https://rustdesk.com/docs/en/self-host/rustdesk-server-pro/installscript/#convert-from-open-source)
-
-Self-host your own RustDesk server, it is free and open source.
-
-> [!IMPORTANT]
-> **Need more features?** [RustDesk Server Pro](https://rustdesk.com/pricing.html) might suit you better.
->
-> **Want to develop your own server?** Start with [rustdesk-server-demo](https://github.com/rustdesk/rustdesk-server-demo), a simpler starting point than this repository.
-
-## How to build manually
+## Binaries
 
 ```bash
 cargo build --release
 ```
 
-Three executables will be generated in target/release.
+Three executables are generated in `target/release`:
 
-- hbbs - RustDesk ID/Rendezvous server
-- hbbr - RustDesk relay server
-- rustdesk-utils - RustDesk CLI utilities
+- `hbbs` — ID/rendezvous server (default port 21116)
+- `hbbr` — relay server (default port 21117)
+- `rustdesk-utils` — CLI utilities (`genkeypair`, `validatekeypair`, `doctor`)
 
-You can find updated binaries on the [Releases](https://github.com/rustdesk/rustdesk-server/releases) page.
+## Listeners
 
-## Configuration
+| Service | Port | Notes |
+|---|---|---|
+| hbbs NAT test | 21115 (ID port - 1) | TCP |
+| hbbs ID/rendezvous | 21116 (ID port) | TCP + UDP |
+| hbbr relay | 21117 (relay port) | TCP |
+| hbbs WebSocket | 21118 (ID port + 2) | for WS clients |
+| hbbr WebSocket | 21119 (relay port + 2, i.e. ID port + 3) | for WS clients |
 
-`hbbs` and `hbbr` can be configured with command-line flags, environment
-variables, or an `.env` / config file. Run `hbbs --help` or `hbbr --help` to see
-the available flags.
+Both binaries accept `-b/--bind <IP>` (`BIND`) to listen on a single
+interface instead of all of them.
 
-The most common options:
+## Options
 
-| Option | Flag | Env var | Applies to | Purpose |
-| --- | --- | --- | --- | --- |
-| Key | `-k` | `KEY` | hbbs, hbbr | `hbbs` loads/generates one by default |
-| Bind address | `-b` | `BIND` | hbbs, hbbr | Local IP address to listen on (default: all interfaces; requires 1.1.17+) |
-| Port | `-p` | `PORT` | hbbs, hbbr | Listening port (hbbs `21116`, hbbr `21117`) |
-| Relay servers | `-r` | `RELAY-SERVERS` | hbbs | Override when the relay uses a different address or a non-standard port |
-| Force relay | — | `ALWAYS_USE_RELAY` | hbbs | `Y` disables direct connections |
-| Log level | — | `RUST_LOG` | hbbs, hbbr | e.g. `debug` (default `info`) |
+### `--trust-proxy-headers` (hbbs and hbbr)
 
-See **[docs/environment-variables.md](docs/environment-variables.md)** for the
-full list of variables, the file/flag/env precedence rules, database and relay
-bandwidth tuning, Docker image variables, and examples.
+When set to `Y` (flag or `TRUST_PROXY_HEADERS` env var), the WebSocket
+listeners take the client address from the `X-Real-IP` /
+`X-Forwarded-For` headers instead of the TCP source address.
 
-## Installation
+Only enable this behind a trusted reverse proxy that overwrites those
+headers; otherwise any client can spoof its IP and bypass IP-based
+blocking/rate limiting.
 
-Please follow this [doc](https://rustdesk.com/docs/en/self-host/rustdesk-server-oss/)
+### `--api-server <URL>` (hbbs)
+
+Base URL of the HTTP API server backing the built-in API proxy. Clients
+send `HttpProxyRequest` messages over the rendezvous channel, and hbbs
+forwards them (paths under `/api/` and `/lic/web/api/` only) to this
+server. Defaults to `API_SERVER` env var or `http://127.0.0.1:<ID port - 2>`.
+
+### Keys
+
+Run with `-k <key>` to restrict access to clients that present the same
+key. The key pair is read from/generated to `id_ed25519`(`.pub`) in the
+working directory; `rustdesk-utils genkeypair` creates one manually.
+
+Env vars can also be provided via a `.env` file (INI format) in the
+working directory. See
+**[docs/environment-variables.md](docs/environment-variables.md)** for the
+full variable list, precedence rules, and tuning options.
+
+## License and attribution
+
+Fork of [RustDesk Server OSS](https://github.com/rustdesk/rustdesk-server)
+by Purslane Ltd., used under the [AGPL-3.0](LICENSE) license. This fork
+(Camellia) remains licensed under AGPL-3.0. Upstream documentation:
+<https://rustdesk.com/docs/en/self-host/>.
