@@ -1,6 +1,11 @@
 #!/command/with-contenv sh
-sleep 2
+# shellcheck shell=sh
+
+set -eu
+if [ -z "${RELAY:-}" ]; then
+  echo "RELAY must be set to the externally reachable relay host:port" >&2
+  exit 64
+fi
+
 cd /data
-PARAMS=
-[ "${ENCRYPTED_ONLY}" = "1" ] && PARAMS="-k _"
-/usr/bin/hbbs -r $RELAY $PARAMS
+exec s6-setuidgid nobody /usr/bin/hbbs -r "$RELAY" -k _

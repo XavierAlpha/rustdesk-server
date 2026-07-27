@@ -1,0 +1,23 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+
+set -eu
+service_exit=${1:-256}
+service_signal=${2:-0}
+
+if [ "$service_exit" -eq 256 ]; then
+  container_exit=$((128 + service_signal))
+else
+  container_exit=$service_exit
+fi
+
+# A sibling service receives SIGTERM after this script halts the container and
+# may exit cleanly. Never let that later zero overwrite the original failure.
+result_file=/run/s6-linux-init-container-results/exitcode
+if [ "$container_exit" -ne 0 ] || [ ! -e "$result_file" ]; then
+  printf '%s\n' "$container_exit" > "$result_file"
+fi
+if [ "$container_exit" -ne 0 ]; then
+  echo "Critical hbbs service terminated (exit=$service_exit signal=$service_signal); stopping container" >&2
+fi
+exec /run/s6/basedir/bin/halt

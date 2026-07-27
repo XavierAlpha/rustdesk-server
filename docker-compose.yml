@@ -1,36 +1,81 @@
-version: '3'
+name: camellia-server
 
-networks:
-  rustdesk-net:
-    external: false
+x-server: &server
+  image: ${CAMELLIA_SERVER_IMAGE:?Set CAMELLIA_SERVER_IMAGE to an immutable classic Camellia server image digest}
+  user: "${CAMELLIA_UID:-10001}:${CAMELLIA_GID:-10001}"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  restart: unless-stopped
+  stop_grace_period: 20s
+  volumes:
+    - camellia-data:/data
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+  networks:
+    - camellia
 
 services:
-  hbbs:
-    container_name: hbbs
-    ports:
-      - 21115:21115
-      - 21116:21116
-      - 21116:21116/udp
-      - 21118:21118
-    image: rustdesk/rustdesk-server:latest
-    command: hbbs -r rustdesk.example.com:21117
-    volumes:
-      - ./data:/root
-    networks:
-      - rustdesk-net
-    depends_on:
-      - hbbr
-    restart: unless-stopped
-
   hbbr:
-    container_name: hbbr
+    <<: *server
+    command:
+      - /usr/bin/hbbr
+      - -k
+      - _
     ports:
-      - 21117:21117
-      - 21119:21119
-    image: rustdesk/rustdesk-server:latest
-    command: hbbr
-    volumes:
-      - ./data:/root
-    networks:
-      - rustdesk-net
-    restart: unless-stopped
+      - "${CAMELLIA_BIND_IP:-0.0.0.0}:21117:21117"
+      - "${CAMELLIA_BIND_IP:-0.0.0.0}:21119:21119"
+    healthcheck:
+      test: ["CMD", "/usr/bin/rustdesk-utils", "healthcheck", "127.0.0.1:21117"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  hbbs:
+    <<: *server
+    environment:
+      API_SERVER: ${CAMELLIA_API_SERVER:?Set CAMELLIA_API_SERVER to the API server origin}
+      DEVICE_VERIFICATION_TOKEN_FILE: /run/secrets/device_verification_token
+    secrets:
+      - device_verification_token
+    command:
+      - /usr/bin/hbbs
+      - -k
+      - _
+      - -r
+      - ${CAMELLIA_RELAY_ADDRESS:?Set CAMELLIA_RELAY_ADDRESS to the public relay host:port}
+    ports:
+      - "${CAMELLIA_BIND_IP:-0.0.0.0}:21115:21115"
+      - "${CAMELLIA_BIND_IP:-0.0.0.0}:21116:21116"
+      - "${CAMELLIA_BIND_IP:-0.0.0.0}:21116:21116/udp"
+      - "${CAMELLIA_BIND_IP:-0.0.0.0}:21118:21118"
+    depends_on:
+      hbbr:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/bin/rustdesk-utils", "healthcheck", "127.0.0.1:21116"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  camellia:
+    driver: bridge
+
+volumes:
+  camellia-data:
+    name: camellia-server-data
+
+secrets:
+  device_verification_token:
+    file: ${CAMELLIA_DEVICE_VERIFICATION_TOKEN_FILE:?Set CAMELLIA_DEVICE_VERIFICATION_TOKEN_FILE to the shared API verification secret file}

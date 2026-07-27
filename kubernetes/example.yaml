@@ -1,95 +1,250 @@
+# Replace the image digest and both .invalid values before applying this file.
+# Create the required secret out of band, for example:
+# kubectl create secret generic camellia-server-secrets \
+#   --from-file=device-verification-token=/secure/device-verification-token
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: camellia-server
+  labels:
+    app.kubernetes.io/name: camellia-server
+data:
+  api-server: https://api.example.invalid
+  relay-address: relay.example.invalid:21117
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rustdesk-server
+  name: camellia-server
+  labels:
+    app.kubernetes.io/name: camellia-server
 spec:
   replicas: 1
+  revisionHistoryLimit: 2
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: rustdesk
+      app.kubernetes.io/name: camellia-server
   template:
     metadata:
       labels:
-        app: rustdesk
+        app.kubernetes.io/name: camellia-server
     spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-        # id Server (HBBS)
         - name: hbbs
-          image: rustdesk/rustdesk-server:latest
+          # Pin a digest produced by this repository's release workflow.
+          image: ghcr.io/xavieralpha/rustdesk-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/bin/hbbs
+          args:
+            - -k
+            - _
+            - -r
+            - $(RELAY_ADDRESS)
           env:
-            - name: RELAY_HOST
-              value: "rustdesk.yourdomain.tld"
-          command: ["hbbs", "-r", "$(RELAY_HOST):21117", "-k", "_"]
-          volumeMounts:
-            - mountPath: /root
-              name: rustdesk-data
+            - name: API_SERVER
+              valueFrom:
+                configMapKeyRef:
+                  name: camellia-server
+                  key: api-server
+            - name: RELAY_ADDRESS
+              valueFrom:
+                configMapKeyRef:
+                  name: camellia-server
+                  key: relay-address
+            - name: DEVICE_VERIFICATION_TOKEN_FILE
+              value: /run/secrets/device-verification-token
+            - name: RUST_LOG
+              value: info
           ports:
-            - containerPort: 21115
-            - containerPort: 21116
+            - name: nat-test
+              containerPort: 21115
               protocol: TCP
-            - containerPort: 21116
+            - name: rendezvous-tcp
+              containerPort: 21116
+              protocol: TCP
+            - name: rendezvous-udp
+              containerPort: 21116
               protocol: UDP
-            - containerPort: 21118
-
-        # Relay Server (HBBR)
-        - name: hbbr
-          image: rustdesk/rustdesk-server:latest
-          command: ["hbbr", "-k", "_"]
+            - name: rendezvous-ws
+              containerPort: 21118
+              protocol: TCP
+          startupProbe:
+            exec:
+              command:
+                - /usr/bin/rustdesk-utils
+                - healthcheck
+                - 127.0.0.1:21116
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 1
+          readinessProbe:
+            exec:
+              command:
+                - /usr/bin/rustdesk-utils
+                - healthcheck
+                - 127.0.0.1:21116
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /usr/bin/rustdesk-utils
+                - healthcheck
+                - 127.0.0.1:21116
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
           volumeMounts:
-            - mountPath: /root
-              name: rustdesk-data
+            - name: data
+              mountPath: /data
+            - name: device-verification-token
+              mountPath: /run/secrets/device-verification-token
+              subPath: device-verification-token
+              readOnly: true
+
+        - name: hbbr
+          # Keep this digest identical to the hbbs image above.
+          image: ghcr.io/xavieralpha/rustdesk-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/bin/hbbr
+          args:
+            - -k
+            - _
           ports:
-            - containerPort: 21117
-            - containerPort: 21119
+            - name: relay
+              containerPort: 21117
+              protocol: TCP
+            - name: relay-ws
+              containerPort: 21119
+              protocol: TCP
+          startupProbe:
+            exec:
+              command:
+                - /usr/bin/rustdesk-utils
+                - healthcheck
+                - 127.0.0.1:21117
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 1
+          readinessProbe:
+            exec:
+              command:
+                - /usr/bin/rustdesk-utils
+                - healthcheck
+                - 127.0.0.1:21117
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /usr/bin/rustdesk-utils
+                - healthcheck
+                - 127.0.0.1:21117
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
 
       volumes:
-        - name: rustdesk-data
+        - name: data
           persistentVolumeClaim:
-            claimName: rustdesk-pvc
+            claimName: camellia-server-data
+        - name: device-verification-token
+          secret:
+            secretName: camellia-server-secrets
+            defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: rustdesk-service
+  name: camellia-server
+  labels:
+    app.kubernetes.io/name: camellia-server
 spec:
-  type: LoadBalancer # Or NodePort
+  type: LoadBalancer
+  externalTrafficPolicy: Local
   selector:
-    app: rustdesk
+    app.kubernetes.io/name: camellia-server
   ports:
-    - name: hbbs-tcp
+    - name: nat-test
       port: 21115
-      targetPort: 21115
+      targetPort: nat-test
       protocol: TCP
-    - name: hbbs-udp
+    - name: rendezvous-tcp
       port: 21116
-      targetPort: 21116
+      targetPort: rendezvous-tcp
+      protocol: TCP
+    - name: rendezvous-udp
+      port: 21116
+      targetPort: rendezvous-udp
       protocol: UDP
-    - name: hbbs-tcp-main
-      port: 21116
-      targetPort: 21116
-      protocol: TCP
-    - name: hbbr-tcp
+    - name: relay
       port: 21117
-      targetPort: 21117
+      targetPort: relay
       protocol: TCP
-    - name: hbbs-ws
+    - name: rendezvous-ws
       port: 21118
-      targetPort: 21118
+      targetPort: rendezvous-ws
       protocol: TCP
-    - name: hbbr-ws
+    - name: relay-ws
       port: 21119
-      targetPort: 21119
+      targetPort: relay-ws
       protocol: TCP
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: rustdesk-pvc
+  name: camellia-server-data
+  labels:
+    app.kubernetes.io/name: camellia-server
 spec:
   accessModes:
-    - ReadWriteOnce # RWM would be available only with pro version
+    - ReadWriteOnce
   resources:
     requests:
       storage: 1Gi

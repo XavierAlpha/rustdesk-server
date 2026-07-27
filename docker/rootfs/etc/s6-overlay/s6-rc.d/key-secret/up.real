@@ -1,58 +1,82 @@
 #!/command/with-contenv sh
+# shellcheck shell=sh
 
-if [ ! -d /data ] ; then
-  mkdir /data
-fi
+set -eu
+umask 077
 
-# normal docker secrets
-if [ ! -f /data/id_ed25519.pub ] && [ -r /run/secrets/key_pub ] ; then
-  cp /run/secrets/key_pub /data/id_ed25519.pub
-  echo "Public key created from secret"
-fi
+mkdir -p /data
+chmod 0700 /data
 
-if [ ! -f /data/id_ed25519 ] && [ -r /run/secrets/key_priv ] ; then
-  cp /run/secrets/key_priv /data/id_ed25519
-  echo "Private key created from secret"
-fi
-
-# ENV variables
-if [ ! -f /data/id_ed25519.pub ] && [ ! "$KEY_PUB" = "" ] ; then
-  echo -n "$KEY_PUB" > /data/id_ed25519.pub
-  echo "Public key created from ENV variable"
-fi
-
-if [ ! -f /data/id_ed25519 ] && [ ! "$KEY_PRIV" = "" ] ; then
-  echo -n "$KEY_PRIV" > /data/id_ed25519
-  echo "Private key created from ENV variable"
-fi
-
-# check if both keys provided
-if [ -f /data/id_ed25519.pub ] && [ ! -f /data/id_ed25519 ] ; then
-  echo "Private key missing."
-  echo "You must provide BOTH the private and the public key."
+temp_path=
+cleanup() {
+  if [ -n "$temp_path" ]; then
+    rm -f -- "$temp_path"
+  fi
+}
+fatal() {
+  echo "$1" >&2
   /run/s6/basedir/bin/halt
   exit 1
+}
+trap cleanup EXIT HUP INT TERM
+
+install_secret() {
+  source_path=$1
+  target_path=$2
+  label=$3
+
+  if [ -L "$target_path" ] || { [ -e "$target_path" ] && [ ! -f "$target_path" ]; }; then
+    fatal "$label path must be a regular file: $target_path"
+  fi
+  if [ -e "$target_path" ]; then
+    return
+  fi
+  if [ ! -e "$source_path" ]; then
+    return
+  fi
+  if [ -L "$source_path" ] || [ ! -f "$source_path" ] || [ ! -r "$source_path" ]; then
+    fatal "$label Docker secret must be a readable regular file: $source_path"
+  fi
+  source_size=$(wc -c < "$source_path")
+  if [ "$source_size" -gt 1024 ]; then
+    fatal "$label Docker secret exceeds the 1024-byte limit"
+  fi
+
+  temp_path=$(mktemp "${target_path}.tmp.XXXXXX")
+  cp "$source_path" "$temp_path"
+  chmod 0600 "$temp_path"
+  if ln "$temp_path" "$target_path"; then
+    echo "$label created from Docker secret"
+  elif [ -L "$target_path" ] || [ ! -f "$target_path" ]; then
+    fatal "Unable to publish $label safely: $target_path"
+  fi
+  rm -f -- "$temp_path"
+  temp_path=
+}
+
+install_secret /run/secrets/key_priv /data/id_ed25519 "Private key"
+install_secret /run/secrets/key_pub /data/id_ed25519.pub "Public key"
+
+# A public key cannot recover its private half. A private key alone is valid:
+# hbbs/hbbr derive and atomically repair the public file before serving.
+if [ -f /data/id_ed25519.pub ] && [ ! -f /data/id_ed25519 ]; then
+  fatal "Private key missing; remove the orphan public key or provide key_priv."
 fi
 
-if [ ! -f /data/id_ed25519.pub ] && [ -f /data/id_ed25519 ] ; then
-  echo "Public key missing."
-  echo "You must provide BOTH the private and the public key."
-  /run/s6/basedir/bin/halt
-  exit 1
+if [ -f /data/id_ed25519 ]; then
+  chmod 0600 /data/id_ed25519
+fi
+if [ -f /data/id_ed25519.pub ]; then
+  chmod 0600 /data/id_ed25519.pub
 fi
 
-# here we have either no keys or both
+# Base images name UID/GID 65534 differently (for example, nobody:nobody or
+# nobody:nogroup). Numeric ownership is stable while s6-setuidgid still
+# resolves the unprivileged account by name.
+chown 65534:65534 /data
+chown 65534:65534 /data/id_ed25519 2>/dev/null || true
+chown 65534:65534 /data/id_ed25519.pub 2>/dev/null || true
 
-# if we have both keys, we fix permissions and ownership
-# and check for keypair validation
-if [ -f /data/id_ed25519.pub ] && [ -f /data/id_ed25519 ] ; then
-  chmod 0600 /data/id_ed25519.pub /data/id_ed25519
-  chown root:root /data/id_ed25519.pub /data/id_ed25519
-  /usr/bin/rustdesk-utils validatekeypair "$(cat /data/id_ed25519.pub)" "$(cat /data/id_ed25519)" || {
-    echo "Key pair not valid"
-    /run/s6/basedir/bin/halt
-    exit 1
-  }
-fi
-
-# if we have no keypair, hbbs will generate one
+# With no key, the first server process creates one atomically. Existing keys
+# are validated and the public half is derived from the private half in Rust,
+# without putting the secret in a process argument.
