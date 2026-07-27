@@ -7,9 +7,11 @@ use hbb_common::{
 use ini::Ini;
 use sodiumoxide::crypto::sign;
 use std::{
+    collections::HashSet,
+    fs::{self, File, OpenOptions},
     io::prelude::*,
-    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
     time::{Instant, SystemTime},
 };
 
@@ -79,31 +81,73 @@ pub(crate) fn get_expired_time() -> Instant {
 }
 
 #[allow(dead_code)]
-pub(crate) fn test_if_valid_server(host: &str, name: &str) -> ResultType<SocketAddr> {
-    use std::net::ToSocketAddrs;
-    let res = if host.contains(':') {
-        host.to_socket_addrs()?.next().context("")
-    } else {
-        format!("{}:{}", host, 0)
-            .to_socket_addrs()?
-            .next()
-            .context("")
-    };
-    if res.is_err() {
-        log::error!("Invalid {} {}: {:?}", name, host, res);
+pub(crate) fn get_servers(value: &str, name: &str) -> ResultType<Vec<String>> {
+    const MAX_SERVER_LIST_BYTES: usize = 4 * 1024;
+    const MAX_SERVER_COUNT: usize = 64;
+    const MAX_SERVER_BYTES: usize = 512;
+
+    if value.len() > MAX_SERVER_LIST_BYTES {
+        hbb_common::bail!("{name} is too large");
     }
-    res
+    if value.trim().is_empty() {
+        log::info!("{}=[]", name);
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut servers = Vec::new();
+    for raw_server in value.split(',') {
+        let server = raw_server.trim();
+        if server.is_empty() {
+            hbb_common::bail!("{name} contains an empty server entry");
+        }
+        if server.len() > MAX_SERVER_BYTES || server.chars().any(char::is_control) {
+            hbb_common::bail!("{name} contains an invalid server");
+        }
+        let parsed = reqwest::Url::parse(&format!("tcp://{server}"))
+            .with_context(|| format!("{name} contains an invalid server: {server}"))?;
+        let host = parsed
+            .host_str()
+            .with_context(|| format!("{name} server has no host: {server}"))?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !matches!(parsed.path(), "" | "/")
+            || parsed.port() == Some(0)
+        {
+            hbb_common::bail!("{name} must contain only host or host:port values");
+        }
+        let canonical_host = host.trim_end_matches('.').to_ascii_lowercase();
+        if canonical_host == "invalid" || canonical_host.ends_with(".invalid") {
+            hbb_common::bail!("{name} contains a placeholder .invalid host");
+        }
+        if seen.insert(server.to_owned()) {
+            servers.push(server.to_owned());
+            if servers.len() > MAX_SERVER_COUNT {
+                hbb_common::bail!("{name} contains too many servers");
+            }
+        }
+    }
+    log::info!("{}={:?}", name, servers);
+    Ok(servers)
 }
 
 #[allow(dead_code)]
-pub(crate) fn get_servers(s: &str, tag: &str) -> Vec<String> {
-    let servers: Vec<String> = s
-        .split(',')
-        .filter(|x| !x.is_empty() && test_if_valid_server(x, tag).is_ok())
-        .map(|x| x.to_owned())
-        .collect();
-    log::info!("{}={:?}", tag, servers);
-    servers
+pub(crate) fn server_with_default_port(
+    server: &str,
+    name: &str,
+    default_port: u16,
+) -> ResultType<String> {
+    let parsed = reqwest::Url::parse(&format!("tcp://{server}"))
+        .with_context(|| format!("{name} contains an invalid server: {server}"))?;
+    if parsed.port().is_some() {
+        return Ok(server.to_owned());
+    }
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("{name} server has no host: {server}"))?;
+    Ok(format!("{host}:{default_port}"))
 }
 
 #[allow(dead_code)]
@@ -118,31 +162,99 @@ pub fn set_arg(name: &str, value: &str) {
     std::env::set_var(arg_name(name), value);
 }
 
+pub fn load_arg_file(path: &Path) -> ResultType<()> {
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+    let contents = read_bounded_regular_file(path, MAX_CONFIG_BYTES, "Configuration file")?;
+    let contents = std::str::from_utf8(&contents)
+        .with_context(|| format!("Configuration file is not UTF-8: {}", path.display()))?;
+    let values = Ini::load_from_str(contents)
+        .with_context(|| format!("Unable to parse configuration file: {}", path.display()))?;
+    if let Some(section) = values.section(None::<String>) {
+        section.iter().for_each(|(key, value)| set_arg(key, value));
+    }
+    Ok(())
+}
+
+fn open_readonly_no_follow(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn read_bounded_open_file(
+    file: &mut File,
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> ResultType<Vec<u8>> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Unable to inspect {label}: {}", path.display()))?;
+    if !metadata.is_file() {
+        hbb_common::bail!("{label} path is not a regular file: {}", path.display());
+    }
+    if metadata.len() > max_bytes as u64 {
+        hbb_common::bail!(
+            "{label} exceeds the {max_bytes}-byte limit: {}",
+            path.display()
+        );
+    }
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut contents)
+        .with_context(|| format!("Unable to read {label}: {}", path.display()))?;
+    if contents.len() > max_bytes {
+        hbb_common::bail!(
+            "{label} exceeds the {max_bytes}-byte limit: {}",
+            path.display()
+        );
+    }
+    Ok(contents)
+}
+
+pub(crate) fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> ResultType<Vec<u8>> {
+    let mut file = open_readonly_no_follow(path)
+        .with_context(|| format!("Unable to open {label}: {}", path.display()))?;
+    read_bounded_open_file(&mut file, path, max_bytes, label)
+}
+
+pub fn load_arg_file_if_present(path: &Path) -> ResultType<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => load_arg_file(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("Unable to inspect configuration file: {}", path.display())),
+    }
+}
+
 #[allow(dead_code)]
-pub fn init_args(args: Vec<Arg>, name: &str, about: &str) {
+pub fn init_args(args: Vec<Arg>, name: &str, about: &str) -> ResultType<()> {
     let matches = Command::new(name.to_owned())
         .version(crate::version::VERSION)
         .author("Purslane Ltd. <info@rustdesk.com>")
         .about(about.to_owned())
         .args(args)
         .get_matches();
-    if let Ok(v) = Ini::load_from_file(".env") {
-        if let Some(section) = v.section(None::<String>) {
-            section.iter().for_each(|(k, v)| set_arg(k, v));
-        }
-    }
+    let default_path = Path::new(".env");
+    load_arg_file_if_present(default_path)?;
     if let Some(config) = matches.get_one::<String>("config") {
-        if let Ok(v) = Ini::load_from_file(config) {
-            if let Some(section) = v.section(None::<String>) {
-                section.iter().for_each(|(k, v)| set_arg(k, v));
-            }
-        }
+        load_arg_file(Path::new(config))?;
     }
     for id in matches.ids() {
         if let Some(v) = matches.get_one::<String>(id.as_str()) {
             set_arg(id.as_str(), v);
         }
     }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -182,6 +294,39 @@ pub fn get_arg_or(name: &str, default: String) -> String {
     get_arg_opt(name).unwrap_or(default)
 }
 
+pub fn parse_yes_no(name: &str, value: &str) -> ResultType<bool> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "Y" => Ok(true),
+        "N" => Ok(false),
+        _ => hbb_common::bail!("{name} must be Y or N"),
+    }
+}
+
+pub fn get_yes_no_arg(name: &str, default: bool) -> ResultType<bool> {
+    match get_arg_opt(name).filter(|value| !value.trim().is_empty()) {
+        Some(value) => parse_yes_no(name, &value),
+        None => Ok(default),
+    }
+}
+
+pub fn get_bounded_usize_arg(
+    name: &str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> ResultType<usize> {
+    let value = match get_arg_opt(name).filter(|value| !value.trim().is_empty()) {
+        Some(value) => value
+            .parse::<usize>()
+            .with_context(|| format!("{name} must be an integer"))?,
+        None => default,
+    };
+    if !(minimum..=maximum).contains(&value) {
+        hbb_common::bail!("{name} must be between {minimum} and {maximum}");
+    }
+    Ok(value)
+}
+
 #[allow(dead_code)]
 #[inline]
 pub fn now() -> u64 {
@@ -191,54 +336,208 @@ pub fn now() -> u64 {
         .unwrap_or_default()
 }
 
-pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
-    let sk_file = "id_ed25519";
-    if wait > 0 && !std::path::Path::new(sk_file).exists() {
+pub fn gen_sk(wait: u64) -> ResultType<(String, sign::SecretKey)> {
+    load_or_create_keypair(Path::new("id_ed25519"), wait)
+}
+
+pub(crate) fn parse_private_key(encoded: &str, label: &str) -> ResultType<sign::SecretKey> {
+    const MAX_ENCODED_KEY_BYTES: usize = 128;
+    let encoded = encoded.trim();
+    if encoded.len() > MAX_ENCODED_KEY_BYTES {
+        hbb_common::bail!("{label} is too large");
+    }
+    let decoded = BASE64
+        .decode(encoded)
+        .with_context(|| format!("{label} must be a base64 Ed25519 private key"))?;
+    if decoded.len() != sign::SECRETKEYBYTES {
+        hbb_common::bail!(
+            "{label} must be a {}-byte Ed25519 private key",
+            sign::SECRETKEYBYTES
+        );
+    }
+    let seed = sign::Seed::from_slice(&decoded[..sign::SEEDBYTES])
+        .with_context(|| format!("{label} has an invalid Ed25519 seed"))?;
+    let (_, private_key) = sign::keypair_from_seed(&seed);
+    if private_key.as_ref() != decoded {
+        hbb_common::bail!("{label} is not a structurally valid Ed25519 private key");
+    }
+    Ok(private_key)
+}
+
+fn load_or_create_keypair(secret_path: &Path, wait: u64) -> ResultType<(String, sign::SecretKey)> {
+    if wait > 0 && !secret_path.exists() {
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
-    if let Ok(mut file) = std::fs::File::open(sk_file) {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_ok() {
-            let contents = contents.trim();
-            let sk = BASE64.decode(contents).unwrap_or_default();
-            if sk.len() == sign::SECRETKEYBYTES {
-                let mut tmp = [0u8; sign::SECRETKEYBYTES];
-                tmp[..].copy_from_slice(&sk);
-                let pk = BASE64.encode(&tmp[sign::SECRETKEYBYTES / 2..]);
-                log::info!("Private key comes from {}", sk_file);
-                return (pk, Some(sign::SecretKey(tmp)));
-            } else {
-                // don't use log here, since it is async
-                println!("Fatal error: malformed private key in {sk_file}.");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        let gen_func = || {
-            let (tmp, sk) = sign::gen_keypair();
-            (BASE64.encode(tmp), sk)
-        };
-        let (mut pk, mut sk) = gen_func();
-        for _ in 0..300 {
-            if !pk.contains('/') && !pk.contains(':') {
-                break;
-            }
-            (pk, sk) = gen_func();
-        }
-        let pub_file = format!("{sk_file}.pub");
-        if let Ok(mut f) = std::fs::File::create(&pub_file) {
-            f.write_all(pk.as_bytes()).ok();
-            if let Ok(mut f) = std::fs::File::create(sk_file) {
-                let s = BASE64.encode(&sk);
-                if f.write_all(s.as_bytes()).is_ok() {
-                    log::info!("Private/public key written to {}/{}", sk_file, pub_file);
-                    log::debug!("Public key: {}", pk);
-                    return (pk, Some(sk));
-                }
-            }
+
+    if read_secret_key(secret_path)?.is_none() {
+        let secret_key = generate_compatible_secret_key();
+        let encoded = BASE64.encode(secret_key.as_ref());
+        create_secret_key_once(secret_path, encoded.as_bytes())?;
+    }
+
+    let secret_key = read_secret_key(secret_path)?
+        .with_context(|| format!("Private key disappeared: {}", secret_path.display()))?;
+    let public_key = BASE64.encode(&secret_key.as_ref()[sign::SECRETKEYBYTES / 2..]);
+    let mut public_name = secret_path.as_os_str().to_os_string();
+    public_name.push(".pub");
+    let public_path = PathBuf::from(public_name);
+    write_public_key(&public_path, public_key.as_bytes())?;
+    log::info!("Private key loaded from {}", secret_path.display());
+    Ok((public_key, secret_key))
+}
+
+fn read_secret_key(path: &Path) -> ResultType<Option<sign::SecretKey>> {
+    const MAX_PRIVATE_KEY_FILE_BYTES: usize = 1024;
+    let mut file = match open_readonly_no_follow(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        hbb_common::bail!(
+            "Private key path must be a regular file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            log::warn!("Restricted private key permissions to 0600");
         }
     }
-    ("".to_owned(), None)
+    let encoded =
+        read_bounded_open_file(&mut file, path, MAX_PRIVATE_KEY_FILE_BYTES, "Private key")?;
+    let encoded = std::str::from_utf8(&encoded)
+        .with_context(|| format!("Private key is not UTF-8: {}", path.display()))?;
+    let private_key = parse_private_key(encoded, &format!("Private key {}", path.display()))?;
+    Ok(Some(private_key))
+}
+
+fn generate_compatible_secret_key() -> sign::SecretKey {
+    loop {
+        let (public_key, secret_key) = sign::gen_keypair();
+        let encoded = BASE64.encode(public_key);
+        if !encoded.contains('/') && !encoded.contains(':') {
+            return secret_key;
+        }
+    }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn create_secret_key_once(path: &Path, contents: &[u8]) -> ResultType<()> {
+    let parent = parent_directory(path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Private key path has no valid file name")?;
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = (|| -> ResultType<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        match fs::hard_link(&temp_path, path) {
+            Ok(()) => sync_parent_directory(parent),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    })();
+    let _ = fs::remove_file(&temp_path);
+    write_result
+}
+
+fn write_public_key(path: &Path, contents: &[u8]) -> ResultType<()> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        hbb_common::bail!("Public key path must not be a symlink: {}", path.display());
+    }
+    if read_bounded_regular_file(path, contents.len() + 1, "Public key")
+        .is_ok_and(|existing| existing == contents)
+    {
+        return Ok(());
+    }
+    let parent = parent_directory(path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Public key path has no valid file name")?;
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = (|| -> ResultType<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o644);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        for _ in 0..3 {
+            match fs::hard_link(&temp_path, path) {
+                Ok(()) => return sync_parent_directory(parent),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = match fs::symlink_metadata(path) {
+                        Ok(metadata) => metadata,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err.into()),
+                    };
+                    if metadata.file_type().is_symlink() {
+                        hbb_common::bail!(
+                            "Public key path must not be a symlink: {}",
+                            path.display()
+                        );
+                    }
+                    if read_bounded_regular_file(path, contents.len() + 1, "Public key")
+                        .is_ok_and(|existing| existing == contents)
+                    {
+                        return Ok(());
+                    }
+                    match fs::remove_file(path) {
+                        Ok(()) => sync_parent_directory(parent)?,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        hbb_common::bail!("Unable to publish public key: {}", path.display())
+    })();
+    let _ = fs::remove_file(&temp_path);
+    write_result
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> ResultType<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> ResultType<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -280,7 +579,34 @@ mod tests {
     use super::*;
     // The tokio::test macro expands to unqualified `tokio` paths.
     use hbb_common::tokio;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr},
+        path::PathBuf,
+    };
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "camellia-server-{label}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn secret_path(&self) -> PathBuf {
+            self.0.join("id_ed25519")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn argument_names_ignore_case_and_separator() {
@@ -323,6 +649,117 @@ mod tests {
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
         );
         assert!(parse_bind_address("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn server_lists_are_syntax_checked_without_dns() {
+        let servers = get_servers(
+            "relay.example.com:21117, 192.0.2.10, [2001:db8::1]:21117",
+            "relay-servers",
+        )
+        .unwrap();
+        assert_eq!(
+            servers,
+            [
+                "relay.example.com:21117",
+                "192.0.2.10",
+                "[2001:db8::1]:21117"
+            ]
+        );
+
+        for invalid in [
+            "https://relay.example.com",
+            "user@relay.example.com",
+            "relay.example.com/path",
+            "relay.example.com:0",
+            "relay.example.com:not-a-port",
+            "relay.example.invalid:21117",
+            "relay.example.com,",
+            "relay.example.com,,192.0.2.10",
+        ] {
+            assert!(get_servers(invalid, "relay-servers").is_err(), "{invalid}");
+        }
+        assert!(get_servers("", "relay-servers").unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_server_ports_preserve_ipv6_brackets() {
+        assert_eq!(
+            server_with_default_port("relay.example.com", "relay-servers", 21117).unwrap(),
+            "relay.example.com:21117"
+        );
+        assert_eq!(
+            server_with_default_port("[2001:db8::1]", "relay-servers", 21117).unwrap(),
+            "[2001:db8::1]:21117"
+        );
+        assert_eq!(
+            server_with_default_port("[2001:db8::1]:22117", "relay-servers", 21117).unwrap(),
+            "[2001:db8::1]:22117"
+        );
+    }
+
+    #[test]
+    fn private_keys_must_be_structurally_valid() {
+        let (_, private_key) = sign::gen_keypair();
+        let encoded = BASE64.encode(private_key.as_ref());
+        assert_eq!(
+            parse_private_key(&encoded, "Test key").unwrap().as_ref(),
+            private_key.as_ref()
+        );
+
+        let mut inconsistent = private_key.as_ref().to_vec();
+        inconsistent[sign::SECRETKEYBYTES - 1] ^= 1;
+        assert!(parse_private_key(&BASE64.encode(inconsistent), "Test key").is_err());
+        assert!(parse_private_key("not-base64", "Test key").is_err());
+    }
+
+    #[test]
+    fn relative_key_paths_sync_the_working_directory() {
+        assert_eq!(parent_directory(Path::new("id_ed25519")), Path::new("."));
+        assert_eq!(
+            parent_directory(Path::new("keys/id_ed25519")),
+            Path::new("keys")
+        );
+    }
+
+    #[test]
+    fn yes_no_values_are_strict() {
+        assert!(parse_yes_no("FEATURE", "y").unwrap());
+        assert!(!parse_yes_no("FEATURE", "N").unwrap());
+        for invalid in ["", "yes", "true", "1"] {
+            assert!(parse_yes_no("FEATURE", invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn configuration_files_fail_closed() {
+        let directory = TestDirectory::new("configuration");
+        let valid = directory.0.join("valid.env");
+        fs::write(&valid, "CAMELLIA_CONFIG_FILE_TEST=loaded\n").unwrap();
+        load_arg_file(&valid).unwrap();
+        assert_eq!(get_arg("CAMELLIA_CONFIG_FILE_TEST"), "loaded");
+        std::env::remove_var("CAMELLIA-CONFIG-FILE-TEST");
+
+        let malformed = directory.0.join("malformed.env");
+        fs::write(&malformed, "[unterminated\n").unwrap();
+        assert!(load_arg_file(&malformed).is_err());
+
+        let oversized = directory.0.join("oversized.env");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        assert!(load_arg_file(&oversized).is_err());
+        assert!(load_arg_file(&directory.0).is_err());
+        assert!(load_arg_file_if_present(&directory.0.join("missing")).is_ok());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let linked = directory.0.join("linked.env");
+            symlink(&valid, &linked).unwrap();
+            assert!(load_arg_file(&linked).is_err());
+        }
     }
 
     #[hbb_common::tokio::test]
@@ -369,5 +806,93 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn keypair_creation_is_atomic_across_threads() {
+        let directory = TestDirectory::new("key-race");
+        let secret_path = directory.secret_path();
+        let handles = (0..8)
+            .map(|_| {
+                let secret_path = secret_path.clone();
+                std::thread::spawn(move || load_or_create_keypair(&secret_path, 0).unwrap().0)
+            })
+            .collect::<Vec<_>>();
+        let public_keys = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(public_keys
+            .iter()
+            .all(|public_key| public_key == &public_keys[0]));
+        assert_eq!(
+            fs::read_to_string(secret_path.with_file_name("id_ed25519.pub")).unwrap(),
+            public_keys[0]
+        );
+        assert_eq!(
+            load_or_create_keypair(&secret_path, 0).unwrap().0,
+            public_keys[0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_permissions_are_restricted() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = TestDirectory::new("key-mode");
+        let secret_path = directory.secret_path();
+        let (_public_key, _secret_key) = load_or_create_keypair(&secret_path, 0).unwrap();
+        assert_eq!(
+            fs::metadata(secret_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn malformed_private_key_fails_closed() {
+        let directory = TestDirectory::new("bad-key");
+        let secret_path = directory.secret_path();
+        fs::write(&secret_path, "not-a-private-key").unwrap();
+
+        assert!(load_or_create_keypair(&secret_path, 0).is_err());
+    }
+
+    #[test]
+    fn stale_public_key_is_replaced() {
+        let directory = TestDirectory::new("stale-public-key");
+        let secret_path = directory.secret_path();
+        let (public_key, _secret_key) = load_or_create_keypair(&secret_path, 0).unwrap();
+        let public_path = secret_path.with_file_name("id_ed25519.pub");
+        fs::write(&public_path, "stale-public-key").unwrap();
+
+        assert_eq!(
+            load_or_create_keypair(&secret_path, 0).unwrap().0,
+            public_key
+        );
+        assert_eq!(fs::read_to_string(public_path).unwrap(), public_key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_paths_reject_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("key-symlinks");
+        let victim = directory.0.join("victim");
+        fs::write(&victim, "unchanged").unwrap();
+
+        let secret_path = directory.secret_path();
+        symlink(&victim, &secret_path).unwrap();
+        assert!(load_or_create_keypair(&secret_path, 0).is_err());
+        fs::remove_file(&secret_path).unwrap();
+
+        let (_public_key, _secret_key) = load_or_create_keypair(&secret_path, 0).unwrap();
+        let public_path = secret_path.with_file_name("id_ed25519.pub");
+        fs::remove_file(&public_path).unwrap();
+        symlink(&victim, &public_path).unwrap();
+        assert!(load_or_create_keypair(&secret_path, 0).is_err());
+        assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
     }
 }

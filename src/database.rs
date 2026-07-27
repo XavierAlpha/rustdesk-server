@@ -1,8 +1,9 @@
 use hbb_common::{log, ResultType};
 use sqlx::{
-    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
+    ConnectOptions, Connection, Error as SqlxError, Row, SqliteConnection,
 };
-use std::{ops::DerefMut, str::FromStr};
+use std::{ops::DerefMut, str::FromStr, time::Duration};
 
 type Pool = deadpool::managed::Pool<DbPool>;
 
@@ -14,8 +15,13 @@ impl deadpool::managed::Manager for DbPool {
     type Type = SqliteConnection;
     type Error = SqlxError;
     async fn create(&self) -> Result<SqliteConnection, SqlxError> {
-        let opt =
-            SqliteConnectOptions::from_str(&self.url)?.log_statements(log::LevelFilter::Debug);
+        let opt = SqliteConnectOptions::from_str(&self.url)?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full)
+            .busy_timeout(Duration::from_secs(10))
+            .log_statements(log::LevelFilter::Debug);
         SqliteConnection::connect_with(&opt).await
     }
     async fn recycle(
@@ -35,22 +41,14 @@ pub struct Database {
 #[derive(Default)]
 pub struct Peer {
     pub guid: Vec<u8>,
-    pub id: String,
     pub uuid: Vec<u8>,
     pub pk: Vec<u8>,
-    pub user: Option<Vec<u8>>,
     pub info: String,
-    pub status: Option<i64>,
 }
 
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
-        if !std::path::Path::new(url).exists() {
-            std::fs::File::create(url).ok();
-        }
-        let n: usize = crate::common::get_arg_or("MAX_DATABASE_CONNECTIONS", "1".to_owned())
-            .parse()
-            .unwrap_or(1);
+        let n = crate::common::get_bounded_usize_arg("MAX_DATABASE_CONNECTIONS", 1, 1, 32)?;
         log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
         let pool = Pool::builder(DbPool {
             url: url.to_owned(),
@@ -64,7 +62,7 @@ impl Database {
     }
 
     async fn create_tables(&self) -> ResultType<()> {
-        sqlx::query!(
+        sqlx::query(
             "
             create table if not exists peer (
                 guid blob primary key not null,
@@ -81,7 +79,7 @@ impl Database {
             create index if not exists index_peer_user on peer (user);
             create index if not exists index_peer_created_at on peer (created_at);
             create index if not exists index_peer_status on peer (status);
-        "
+        ",
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -89,13 +87,19 @@ impl Database {
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
-        Ok(sqlx::query_as!(
-            Peer,
-            "select guid, id, uuid, pk, user, status, info from peer where id = ?",
-            id
-        )
-        .fetch_optional(self.pool.get().await?.deref_mut())
-        .await?)
+        let row = sqlx::query("select guid, uuid, pk, info from peer where id = ?")
+            .bind(id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?;
+        match row {
+            Some(row) => Ok(Some(Peer {
+                guid: row.try_get("guid")?,
+                uuid: row.try_get("uuid")?,
+                pk: row.try_get("pk")?,
+                info: row.try_get("info")?,
+            })),
+            None => Ok(None),
+        }
     }
 
     pub async fn insert_peer(
@@ -106,35 +110,33 @@ impl Database {
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
-        sqlx::query!(
-            "insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
-            guid,
-            id,
-            uuid,
-            pk,
-            info
-        )
-        .execute(self.pool.get().await?.deref_mut())
-        .await?;
+        sqlx::query("insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)")
+            .bind(guid.as_slice())
+            .bind(id)
+            .bind(uuid)
+            .bind(pk)
+            .bind(info)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
         Ok(guid)
     }
 
-    pub async fn update_pk(
+    pub async fn update_identity(
         &self,
-        guid: &Vec<u8>,
+        guid: &[u8],
         id: &str,
+        uuid: &[u8],
         pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
-        sqlx::query!(
-            "update peer set id=?, pk=?, info=? where guid=?",
-            id,
-            pk,
-            info,
-            guid
-        )
-        .execute(self.pool.get().await?.deref_mut())
-        .await?;
+        sqlx::query("update peer set id=?, uuid=?, pk=?, info=? where guid=?")
+            .bind(id)
+            .bind(uuid)
+            .bind(pk)
+            .bind(info)
+            .bind(guid)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
         Ok(())
     }
 }
@@ -142,35 +144,77 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use hbb_common::tokio;
-    #[test]
-    fn test_insert() {
-        insert();
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    struct TestDatabaseDirectory {
+        directory: PathBuf,
+        path: PathBuf,
     }
 
-    #[tokio::main(flavor = "multi_thread")]
-    async fn insert() {
-        let db = super::Database::new("test.sqlite3").await.unwrap();
+    impl TestDatabaseDirectory {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "camellia-server-database-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&directory).unwrap();
+            Self {
+                directory: directory.clone(),
+                path: directory.join("database.sqlite3"),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn directory(&self) -> &Path {
+            &self.directory
+        }
+    }
+
+    impl Drop for TestDatabaseDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_insert_and_read() {
+        let directory = TestDatabaseDirectory::new();
+        let path = directory.path().to_owned();
+        let path_string = path.to_string_lossy().into_owned();
+        let db = super::Database::new(&path_string).await.unwrap();
         let mut jobs = vec![];
-        for i in 0..10000 {
+        for i in 0..256 {
             let cloned = db.clone();
             let id = i.to_string();
-            let a = tokio::spawn(async move {
+            jobs.push(tokio::spawn(async move {
                 let empty_vec = Vec::new();
-                cloned
-                    .insert_peer(&id, &empty_vec, &empty_vec, "")
-                    .await
-                    .unwrap();
-            });
-            jobs.push(a);
+                cloned.insert_peer(&id, &empty_vec, &empty_vec, "").await
+            }));
         }
-        for i in 0..10000 {
+        for job in jobs {
+            job.await.unwrap().unwrap();
+        }
+
+        let mut jobs = vec![];
+        for i in 0..256 {
             let cloned = db.clone();
             let id = i.to_string();
-            let a = tokio::spawn(async move {
-                cloned.get_peer(&id).await.unwrap();
-            });
-            jobs.push(a);
+            jobs.push(tokio::spawn(async move { cloned.get_peer(&id).await }));
         }
-        hbb_common::futures::future::join_all(jobs).await;
+        for job in jobs {
+            assert!(job.await.unwrap().unwrap().is_some());
+        }
+        db.pool.close();
+        drop(db);
+        let temporary_directory = directory.directory().to_owned();
+        drop(directory);
+        assert!(!temporary_directory.exists());
     }
 }

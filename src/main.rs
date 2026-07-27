@@ -25,7 +25,7 @@ fn main() -> ResultType<()> {
             .long("bind")
             .value_name("IP")
             .help("Sets the IP address to bind to (default: all interfaces)"),
-        Arg::new("port")
+        Arg::new("hbbs-port")
             .short('p')
             .long("port")
             .value_name(format!("NUMBER(default={RENDEZVOUS_PORT})"))
@@ -40,11 +40,6 @@ fn main() -> ResultType<()> {
             .long("rendezvous-servers")
             .value_name("HOSTS")
             .help("[DEPRECATED] Sets rendezvous servers, separated by comma"),
-        Arg::new("software-url")
-            .short('u')
-            .long("software-url")
-            .value_name("URL")
-            .help("[DEPRECATED] Sets download url of RustDesk software of newest version"),
         Arg::new("relay-servers")
             .short('r')
             .long("relay-servers")
@@ -73,15 +68,21 @@ fn main() -> ResultType<()> {
             .value_name("KEY")
             .help("Only allow the client with the same key"),
     ];
-    init_args(args, "hbbs", "RustDesk ID/Rendezvous Server");
-    let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
-    if port < 3 {
-        bail!("Invalid port");
+    init_args(args, "hbbs", "RustDesk ID/Rendezvous Server")?;
+    let port = get_arg_or("hbbs-port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
+    if !(3..=65_533).contains(&port) {
+        bail!("Port must be between 3 and 65533");
     }
     let bind_addr = parse_bind_address(&get_arg("bind"))?;
-    let rmem = get_arg("rmem").parse::<usize>().unwrap_or(RMEM);
-    let serial: i32 = get_arg("serial").parse().unwrap_or(0);
-    check_software_update();
+    let rmem = get_arg_opt("rmem")
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(RMEM);
+    let serial = get_arg_or("serial", "0".to_owned()).parse::<i32>()?;
+    if serial < 0 {
+        bail!("Serial must not be negative");
+    }
     RendezvousServer::start_with_bind(
         bind_addr,
         port,

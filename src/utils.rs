@@ -1,12 +1,21 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use dns_lookup::{lookup_addr, lookup_host};
-use hbb_common::{bail, ResultType};
+use hbb_common::{
+    anyhow::{anyhow, Context as _},
+    bail, ResultType,
+};
 use sodiumoxide::crypto::sign;
 use std::{
     env,
-    net::{IpAddr, TcpStream},
+    net::{IpAddr, TcpStream, ToSocketAddrs as _},
     process, str,
+    time::{Duration, Instant},
 };
+
+const HEALTHCHECK_TOTAL_TIMEOUT: Duration = Duration::from_secs(3);
+const HEALTHCHECK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const HEALTHCHECK_MAX_ENDPOINTS: usize = 8;
+const DOCTOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn print_help() {
     println!(
@@ -15,7 +24,8 @@ fn print_help() {
 Available Commands:
     genkeypair                                   Generate a new keypair
     validatekeypair [public key] [secret key]    Validate an existing keypair
-    doctor [rustdesk-server]                     Check for server connection problems"
+    doctor [rustdesk-server]                     Check for server connection problems
+    healthcheck [host:port]                      Exit non-zero unless TCP is reachable"
     );
     process::exit(0x0001);
 }
@@ -34,37 +44,17 @@ fn gen_keypair() {
 }
 
 fn validate_keypair(pk: &str, sk: &str) -> ResultType<()> {
-    let sk1 = BASE64.decode(sk);
-    if sk1.is_err() {
-        bail!("Invalid secret key");
-    }
-    let sk1 = sk1.unwrap();
-
-    let secret_key = sign::SecretKey::from_slice(sk1.as_slice());
-    if secret_key.is_none() {
-        bail!("Invalid Secret key");
-    }
-    let secret_key = secret_key.unwrap();
-
-    let pk1 = BASE64.decode(pk);
-    if pk1.is_err() {
-        bail!("Invalid public key");
-    }
-    let pk1 = pk1.unwrap();
-
-    let public_key = sign::PublicKey::from_slice(pk1.as_slice());
-    if public_key.is_none() {
-        bail!("Invalid Public key");
-    }
-    let public_key = public_key.unwrap();
+    let secret_key_bytes = BASE64.decode(sk).context("Invalid secret key encoding")?;
+    let secret_key = sign::SecretKey::from_slice(&secret_key_bytes)
+        .ok_or_else(|| anyhow!("Invalid secret key length"))?;
+    let public_key_bytes = BASE64.decode(pk).context("Invalid public key encoding")?;
+    let public_key = sign::PublicKey::from_slice(&public_key_bytes)
+        .ok_or_else(|| anyhow!("Invalid public key length"))?;
 
     let random_data_to_test = b"This is meh.";
     let signed_data = sign::sign(random_data_to_test, &secret_key);
-    let verified_data = sign::verify(&signed_data, &public_key);
-    if verified_data.is_err() {
-        bail!("Key pair is INVALID");
-    }
-    let verified_data = verified_data.unwrap();
+    let verified_data =
+        sign::verify(&signed_data, &public_key).map_err(|_| anyhow!("Key pair is INVALID"))?;
 
     if random_data_to_test != &verified_data[..] {
         bail!("Key pair is INVALID");
@@ -73,71 +63,109 @@ fn validate_keypair(pk: &str, sk: &str) -> ResultType<()> {
     Ok(())
 }
 
-fn doctor_tcp(address: std::net::IpAddr, port: &str, desc: &str) {
+fn doctor_tcp(address: IpAddr, port: u16, description: &str) -> bool {
     let start = std::time::Instant::now();
-    let conn = format!("{address}:{port}");
-    if let Ok(_stream) = TcpStream::connect(conn.as_str()) {
-        let elapsed = std::time::Instant::now().duration_since(start);
-        println!(
-            "TCP Port {} ({}): OK in {} ms",
-            port,
-            desc,
-            elapsed.as_millis()
-        );
-    } else {
-        println!("TCP Port {port} ({desc}): ERROR");
+    let endpoint = std::net::SocketAddr::new(address, port);
+    match TcpStream::connect_timeout(&endpoint, DOCTOR_CONNECT_TIMEOUT) {
+        Ok(_) => {
+            println!(
+                "TCP Port {} ({}): OK in {} ms",
+                port,
+                description,
+                start.elapsed().as_millis()
+            );
+            true
+        }
+        Err(err) => {
+            println!("TCP Port {port} ({description}): ERROR ({err})");
+            false
+        }
     }
 }
 
-fn doctor_ip(server_ip_address: std::net::IpAddr, server_address: Option<&str>) {
+fn doctor_ip(server_ip_address: IpAddr, server_address: Option<&str>) -> bool {
     println!("\nChecking IP address: {server_ip_address}");
     println!("Is IPV4: {}", server_ip_address.is_ipv4());
     println!("Is IPV6: {}", server_ip_address.is_ipv6());
 
     // reverse dns lookup
     // TODO: (check) doesn't seem to do reverse lookup on OSX...
-    let reverse = lookup_addr(&server_ip_address).unwrap();
-    if let Some(server_address) = server_address {
-        if reverse == server_address {
-            println!("Reverse DNS lookup: '{reverse}' MATCHES server address");
-        } else {
-            println!(
-                "Reverse DNS lookup: '{reverse}' DOESN'T MATCH server address '{server_address}'"
-            );
+    match lookup_addr(&server_ip_address) {
+        Ok(reverse) => {
+            if let Some(server_address) = server_address {
+                if reverse == server_address {
+                    println!("Reverse DNS lookup: '{reverse}' MATCHES server address");
+                } else {
+                    println!(
+                        "Reverse DNS lookup: '{reverse}' DOESN'T MATCH server address '{server_address}'"
+                    );
+                }
+            }
         }
+        Err(err) => println!("Reverse DNS lookup: unavailable ({err})"),
     }
 
-    // TODO: ICMP ping?
-
-    // port check TCP (UDP is hard to check)
-    doctor_tcp(server_ip_address, "21114", "API");
-    doctor_tcp(server_ip_address, "21115", "hbbs extra port for nat test");
-    doctor_tcp(server_ip_address, "21116", "hbbs");
-    doctor_tcp(server_ip_address, "21117", "hbbr tcp");
-    doctor_tcp(server_ip_address, "21118", "hbbs websocket");
-    doctor_tcp(server_ip_address, "21119", "hbbr websocket");
-
-    // TODO: key check
+    let checks = [
+        (21115, "hbbs NAT test"),
+        (21116, "hbbs rendezvous"),
+        (21117, "hbbr relay"),
+        (21118, "hbbs WebSocket"),
+        (21119, "hbbr WebSocket"),
+    ];
+    let mut healthy = true;
+    for (port, description) in checks {
+        healthy &= doctor_tcp(server_ip_address, port, description);
+    }
+    println!("UDP Port 21116 (hbbs rendezvous): not actively probed");
+    healthy
 }
 
-fn doctor(server_address_unclean: &str) {
+fn doctor(server_address_unclean: &str) -> ResultType<()> {
     let server_address3 = server_address_unclean.trim();
     let server_address2 = server_address3.to_lowercase();
     let server_address = server_address2.as_str();
     println!("Checking server:  {server_address}\n");
     if let Ok(server_ipaddr) = server_address.parse::<IpAddr>() {
         // user requested an ip address
-        doctor_ip(server_ipaddr, None);
+        if !doctor_ip(server_ipaddr, None) {
+            bail!("One or more Camellia server TCP listeners are unreachable");
+        }
     } else {
         // the passed string is not an ip address
-        let ips: Vec<std::net::IpAddr> = lookup_host(server_address).unwrap();
+        let ips: Vec<std::net::IpAddr> = lookup_host(server_address)?;
+        if ips.is_empty() {
+            bail!("No IP addresses resolved for {server_address}");
+        }
         println!("Found {} IP addresses: ", ips.len());
 
         ips.iter().for_each(|ip| println!(" - {ip}"));
 
-        ips.iter()
-            .for_each(|ip| doctor_ip(*ip, Some(server_address)));
+        let mut healthy = true;
+        for ip in ips {
+            healthy &= doctor_ip(ip, Some(server_address));
+        }
+        if !healthy {
+            bail!("One or more Camellia server TCP listeners are unreachable");
+        }
     }
+    Ok(())
+}
+
+fn healthcheck(endpoint: &str) -> ResultType<()> {
+    let endpoints = endpoint
+        .to_socket_addrs()
+        .with_context(|| format!("Invalid healthcheck endpoint: {endpoint}"))?;
+    let started_at = Instant::now();
+    for endpoint in endpoints.take(HEALTHCHECK_MAX_ENDPOINTS) {
+        let Some(remaining) = HEALTHCHECK_TOTAL_TIMEOUT.checked_sub(started_at.elapsed()) else {
+            break;
+        };
+        if TcpStream::connect_timeout(&endpoint, remaining.min(HEALTHCHECK_ATTEMPT_TIMEOUT)).is_ok()
+        {
+            return Ok(());
+        }
+    }
+    bail!("TCP healthcheck failed: {endpoint}");
 }
 
 fn main() {
@@ -164,8 +192,39 @@ fn main() {
             if args.len() <= 2 {
                 error_then_help("You must supply the rustdesk-server address");
             }
-            doctor(args[2].as_str());
+            if let Err(err) = doctor(args[2].as_str()) {
+                eprintln!("{err}");
+                process::exit(0x0001);
+            }
+        }
+        "healthcheck" => {
+            if args.len() <= 2 {
+                error_then_help("You must supply a host:port endpoint");
+            }
+            if let Err(err) = healthcheck(args[2].as_str()) {
+                eprintln!("{err}");
+                process::exit(0x0001);
+            }
         }
         _ => print_help(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn healthcheck_accepts_reachable_tcp_endpoint() -> ResultType<()> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let endpoint = listener.local_addr()?.to_string();
+
+        healthcheck(&endpoint)
+    }
+
+    #[test]
+    fn healthcheck_rejects_invalid_endpoint() {
+        assert!(healthcheck("127.0.0.1:not-a-port").is_err());
     }
 }

@@ -4,8 +4,9 @@ mod relay_server;
 use flexi_logger::*;
 use hbb_common::{config::RELAY_PORT, ResultType};
 use relay_server::*;
+use std::path::Path;
 mod version {
-    include!(concat!(env!("OUT_DIR"), "/version.rs"));
+    pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 }
 
 fn main() -> ResultType<()> {
@@ -46,19 +47,9 @@ fn main() -> ResultType<()> {
                 .help("Trust X-Real-IP/X-Forwarded-For on websocket listeners"),
         )
         .get_matches();
-    if let Ok(v) = ini::Ini::load_from_file(".env") {
-        if let Some(section) = v.section(None::<String>) {
-            section.iter().for_each(|(k, v)| common::set_arg(k, v));
-        }
-    }
-    let mut port = RELAY_PORT;
-    if let Some(v) = common::get_arg_opt("PORT") {
-        let v: i32 = v.parse().unwrap_or_default();
-        if v > 0 {
-            port = v + 1;
-        }
-    }
-    let default_port = port.to_string();
+    let default_path = Path::new(".env");
+    common::load_arg_file_if_present(default_path)?;
+    let default_port = common::get_arg_or("HBBR_PORT", RELAY_PORT.to_string());
     let bind = matches
         .get_one::<String>("bind")
         .map(String::to_owned)
@@ -68,10 +59,10 @@ fn main() -> ResultType<()> {
         .get_one::<String>("key")
         .map(String::to_owned)
         .unwrap_or_else(|| common::get_arg("KEY"));
-    let trust_proxy_headers = matches
-        .get_one::<String>("trust-proxy-headers")
-        .map(String::to_owned)
-        .unwrap_or_else(|| common::get_arg("TRUST_PROXY_HEADERS"));
+    let trust_proxy_headers = match matches.get_one::<String>("trust-proxy-headers") {
+        Some(value) => common::parse_yes_no("trust-proxy-headers", value)?,
+        None => common::get_yes_no_arg("TRUST_PROXY_HEADERS", false)?,
+    };
     start_with_bind(
         bind_addr,
         matches
@@ -79,7 +70,7 @@ fn main() -> ResultType<()> {
             .map(String::as_str)
             .unwrap_or(&default_port),
         &key,
-        trust_proxy_headers.eq_ignore_ascii_case("Y"),
+        trust_proxy_headers,
     )?;
     Ok(())
 }
