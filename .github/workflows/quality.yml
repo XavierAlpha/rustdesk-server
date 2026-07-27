@@ -1,0 +1,230 @@
+name: quality
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref or commit to validate
+        required: false
+        type: string
+        default: ""
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  workflow:
+    name: Workflow and deployment configuration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: false
+
+      - name: Lint GitHub Actions
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Lint container scripts
+        run: |
+          shellcheck \
+            docker/rootfs/usr/bin/healthcheck.sh \
+            docker/rootfs/etc/s6-overlay/s6-rc.d/hbbr/finish \
+            docker/rootfs/etc/s6-overlay/s6-rc.d/hbbr/run \
+            docker/rootfs/etc/s6-overlay/s6-rc.d/hbbs/finish \
+            docker/rootfs/etc/s6-overlay/s6-rc.d/hbbs/run \
+            docker/rootfs/etc/s6-overlay/s6-rc.d/key-secret/up.real \
+            debian/rustdesk-server-hbbr.postinst \
+            debian/rustdesk-server-hbbs.postinst
+
+      - name: Verify executable deployment scripts
+        run: |
+          test -x docker/rootfs/usr/bin/healthcheck.sh
+          test -x docker/rootfs/etc/s6-overlay/s6-rc.d/hbbr/finish
+          test -x docker/rootfs/etc/s6-overlay/s6-rc.d/hbbr/run
+          test -x docker/rootfs/etc/s6-overlay/s6-rc.d/hbbs/finish
+          test -x docker/rootfs/etc/s6-overlay/s6-rc.d/hbbs/run
+          test -x docker/rootfs/etc/s6-overlay/s6-rc.d/key-secret/up.real
+          test -x debian/rustdesk-server-hbbr.postinst
+          test -x debian/rustdesk-server-hbbs.postinst
+
+      - name: Validate Debian metadata
+        run: |
+          dpkg-parsechangelog --file debian/changelog >/dev/null
+          systemd-analyze security --offline=yes \
+            debian/rustdesk-server-hbbr.rustdesk-hbbr.service \
+            debian/rustdesk-server-hbbs.rustdesk-hbbs.service >/dev/null
+
+      - name: Build Debian packaging fixture
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y debhelper
+
+          package_root="$RUNNER_TEMP/camellia-debian-fixture"
+          install -d "$package_root/bin"
+          cp -R debian "$package_root/"
+          install -m 0755 /bin/true "$package_root/bin/hbbs"
+          install -m 0755 /bin/true "$package_root/bin/hbbr"
+          install -m 0755 /bin/true "$package_root/bin/rustdesk-utils"
+          sed "s/{{ ARCH }}/$(dpkg --print-architecture)/" debian/control.tpl \
+            > "$package_root/debian/control"
+
+          (
+            cd "$package_root"
+            dpkg-buildpackage --build=binary --no-sign
+          )
+
+          mapfile -t packages < <(
+            find "$RUNNER_TEMP" -maxdepth 1 -type f \
+              -name 'rustdesk-server-*.deb' -print
+          )
+          test "${#packages[@]}" -eq 3
+          for package in "${packages[@]}"; do
+            dpkg-deb --info "$package" >/dev/null
+          done
+          dpkg-deb --contents "$RUNNER_TEMP"/rustdesk-server-hbbs_*.deb \
+            | grep -E '\./(usr/)?lib/systemd/system/rustdesk-hbbs\.service$' >/dev/null
+          dpkg-deb --contents "$RUNNER_TEMP"/rustdesk-server-hbbr_*.deb \
+            | grep -E '\./(usr/)?lib/systemd/system/rustdesk-hbbr\.service$' >/dev/null
+          dpkg-deb --fsys-tarfile "$RUNNER_TEMP"/rustdesk-server-hbbs_*.deb \
+            | tar -xOf - ./usr/bin/hbbs \
+            | cmp - "$package_root/bin/hbbs"
+          dpkg-deb --fsys-tarfile "$RUNNER_TEMP"/rustdesk-server-hbbr_*.deb \
+            | tar -xOf - ./usr/bin/hbbr \
+            | cmp - "$package_root/bin/hbbr"
+          dpkg-deb --fsys-tarfile "$RUNNER_TEMP"/rustdesk-server-utils_*.deb \
+            | tar -xOf - ./usr/bin/rustdesk-utils \
+            | cmp - "$package_root/bin/rustdesk-utils"
+
+      - name: Lint Dockerfiles
+        run: |
+          hadolint_path="$RUNNER_TEMP/hadolint"
+          curl --fail --silent --show-error --location \
+            --output "$hadolint_path" \
+            https://github.com/hadolint/hadolint/releases/download/v2.14.0/hadolint-linux-x86_64
+          echo "6bf226944684f56c84dd014e8b979d27425c0148f61b3bd99bcc6f39e9dc5a47  $hadolint_path" \
+            | sha256sum --check
+          chmod 0755 "$hadolint_path"
+          "$hadolint_path" docker/Dockerfile docker-classic/Dockerfile
+
+      - name: Validate Compose model
+        env:
+          CAMELLIA_API_SERVER: https://api.example.com
+          CAMELLIA_DEVICE_VERIFICATION_TOKEN_FILE: /tmp/device-verification-token
+          CAMELLIA_RELAY_ADDRESS: relay.example.com:21117
+          CAMELLIA_SERVER_IMAGE: ghcr.io/example/camellia-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        run: docker compose --file docker-compose.yml config --quiet
+
+      - name: Validate Kubernetes manifest
+        run: >-
+          go run github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0
+          -strict
+          -summary
+          -kubernetes-version 1.36.0
+          kubernetes/example.yaml
+
+  rust:
+    name: Rust quality gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.93.0
+          components: clippy, rustfmt
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets and features
+        run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Lint server code
+        run: cargo clippy --locked -p hbbs --all-targets --all-features --no-deps -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-features
+
+      - name: Install RustSec audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Verify ignored RSA driver is unreachable
+        run: |
+          if [[ -n "$(cargo tree -i rsa --target all --workspace --all-features 2>/dev/null)" ]]; then
+            echo "RUSTSEC-2023-0071 is reachable; remove the audit exception." >&2
+            exit 1
+          fi
+          if [[ -z "$(cargo tree -i sodiumoxide --target all --workspace --all-features 2>/dev/null)" ]]; then
+            echo "sodiumoxide is gone; remove RUSTSEC-2021-0137 from the audit exceptions." >&2
+            exit 1
+          fi
+
+      - name: Audit locked dependencies
+        # SQLx records its disabled MySQL driver in Cargo.lock. RSA is only
+        # reachable through that unenabled driver (`cargo tree -i rsa
+        # --target all` is empty), and upstream has no patched release.
+        # sodiumoxide is an unmaintained wrapper advisory, not a known
+        # vulnerability; the deployed NaCl wire protocol still uses its
+        # libsodium implementation. Deny every other warning so each future
+        # exception requires an explicit review.
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2021-0137
+
+  windows:
+    name: Windows compile and tests
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: windows-x86_64
+
+      - name: Check all targets and features
+        run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-features
