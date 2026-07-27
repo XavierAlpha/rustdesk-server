@@ -1,62 +1,27 @@
-#
-# Juli Augustus 2025 was building the downloadable Debian packages done
-# by github.com CI, meaning you being depended on github.com
-# for getting a .deb of the libre source code (four GNU freedoms) you have.
-#
-# And in those days there was no official Debian package.
-#
-# What follows are instructions that make it possible to do
-# a succesfull
-#
-#   debuild -uc -us
-#
-# in the directory  target/rustdesk-server
-#
-# The instructions are written in bash syntax,
-#
-#   bash debian/README.source
-#
-# should help you immens
-#
+Camellia server Debian packaging
+================================
 
-# Make sure the submodules are present
-git submodule update --init --recursive
+The Debian rules package three prebuilt, statically linked binaries. They do
+not compile Rust source during the Debian build. This keeps release archives,
+container images, and Debian packages tied to the same Cargo build artifact.
 
-rm -rf target/rustdesk-server  # avoid clutter from previous iteration
-mkdir -p target/rustdesk-server #  FYI: target/ is ignored by git
+For a native local build:
 
-tar cf - \
-    --exclude .git \
-    Cargo.toml Cargo.lock \
-	LICENSE README.md \
-    db_v2.sqlite3 \
-	build.rs \
-	debian \
-	libs rcd src \
-    systemd ui \
-| ( cd target/rustdesk-server && tar x )
+  cargo build --locked --release --all-features
+  install -Dm0755 target/release/hbbs bin/hbbs
+  install -Dm0755 target/release/hbbr bin/hbbr
+  install -Dm0755 target/release/rustdesk-utils bin/rustdesk-utils
+  sed "s/{{ ARCH }}/$(dpkg --print-architecture)/" \
+    debian/control.tpl > debian/control
+  dpkg-buildpackage --build=binary --no-sign
 
-mv target/rustdesk-server/debian/Makefile target/rustdesk-server/
+The release workflow uses the same layout with architecture-specific binaries
+produced by `cross`. Do not substitute a binary built for another Debian
+architecture: the package metadata deliberately declares the target
+architecture rather than `all`.
 
-tar cjf target/rustdesk-server-orig.tar.xz \
-    --strip-components=1 \
-    target/rustdesk-server
-
-# an .orig.tar.xz tarball exists, 
-# work on the debian directory 
-
-eval $( dpkg-architecture )
-sed -e "s/{{ ARCH }}/${DEB_TARGET_ARCH}/" \
-    debian/control.tpl > target/rustdesk-server/debian/control
-    
-
-cd target/rustdesk-server
-dpkg-checkbuilddeps || echo sudo apt install dpkg-dev
-debuild -uc -us
-
-#
-# For what it is worth:
-# Early September 2025 there were
-# several WARNINGS and ERRORS from Lintian
-#
-# l l
+The hbbs unit is enabled by normal debhelper policy but has
+`ConditionFileNotEmpty=/etc/default/camellia-server`; create and validate that
+configuration before starting the service. See docs/environment-variables.md.
+Persistent keys and the SQLite database live in /var/lib/rustdesk-server and
+are intentionally preserved when either package is removed.

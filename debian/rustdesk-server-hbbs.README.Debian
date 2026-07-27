@@ -1,0 +1,24 @@
+Camellia rendezvous server configuration
+----------------------------------------
+
+The package does not start hbbs until /etc/default/camellia-server exists and
+is non-empty. This is intentional: managed device registration requires an
+API origin and a shared verification secret, neither of which can have a safe
+package default.
+
+Start from the packaged example:
+
+  install -m 0640 -o root -g camellia-server \
+    /usr/share/doc/rustdesk-server-hbbs/examples/camellia-server.env.example \
+    /etc/default/camellia-server
+  install -d -m 0750 -o root -g camellia-server /etc/camellia-server
+  openssl rand -hex 32 | install -m 0640 -o root -g camellia-server \
+    /dev/stdin /etc/camellia-server/device-verification-token
+
+Replace the .invalid API and relay values, configure the same secret in the
+Camellia API server, then run:
+
+  systemctl enable --now rustdesk-hbbs.service rustdesk-hbbr.service
+
+The key pair and SQLite database are shared in /var/lib/rustdesk-server and
+are deliberately retained when a package is removed.

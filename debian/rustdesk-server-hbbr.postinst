@@ -1,28 +1,30 @@
 #!/bin/sh
 set -e
 
-SERVICE=rustdesk-hbbr.service
-
-if [ "$1" = "configure" ]; then
-    mkdir -p /var/log/rustdesk-server
+if ! getent group camellia-server >/dev/null; then
+    addgroup --system --quiet camellia-server
+fi
+if ! getent passwd camellia-server >/dev/null; then
+    adduser --system --quiet \
+      --ingroup camellia-server \
+      --home /var/lib/rustdesk-server \
+      --no-create-home \
+      --disabled-login \
+      --gecos "Camellia server" \
+      camellia-server
 fi
 
-case "$1" in
-    configure|abort-upgrade|abort-deconfigure|abort-remove)
-      mkdir -p /var/lib/rustdesk-server/
-	  deb-systemd-helper unmask "${SERVICE}" >/dev/null || true
-	  if deb-systemd-helper --quiet was-enabled "${SERVICE}"; then
-	  	deb-systemd-invoke enable "${SERVICE}" >/dev/null || true
-	  else
-	  	deb-systemd-invoke update-state "${SERVICE}" >/dev/null || true
-	  fi
-	  systemctl --system daemon-reload >/dev/null || true
-	  if [ -n "$2" ]; then
-		deb-systemd-invoke restart "${SERVICE}" >/dev/null || true
-	  else
-		deb-systemd-invoke start "${SERVICE}" >/dev/null || true
-	  fi
-    ;;
-esac
+server_group_gid=$(getent group camellia-server | cut -d: -f3)
+server_user_record=$(getent passwd camellia-server)
+server_user_gid=$(printf '%s\n' "$server_user_record" | cut -d: -f4)
+server_user_home=$(printf '%s\n' "$server_user_record" | cut -d: -f6)
+if [ "$server_user_gid" != "$server_group_gid" ] ||
+   [ "$server_user_home" != /var/lib/rustdesk-server ]; then
+    echo "Existing camellia-server account has an incompatible group or home directory" >&2
+    exit 1
+fi
 
+install -d -m 0700 -o camellia-server -g camellia-server /var/lib/rustdesk-server
+
+#DEBHELPER#
 exit 0

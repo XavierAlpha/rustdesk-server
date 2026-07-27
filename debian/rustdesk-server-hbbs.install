@@ -1,2 +1,1 @@
 bin/hbbs usr/bin
-systemd/rustdesk-hbbs.service lib/systemd/system

@@ -2,5 +2,13 @@
 %:
 	dh $@
 
-override_dh_builddeb:
-	dh_builddeb -- -Zgzip
+override_dh_installsystemd:
+	dh_installsystemd --package=rustdesk-server-hbbs --name=rustdesk-hbbs
+	dh_installsystemd --package=rustdesk-server-hbbr --name=rustdesk-hbbr
+
+# Cargo already strips the release executables. Preserve those exact artifacts
+# in every package and avoid requiring target-specific binutils when wrapping
+# a prebuilt binary for a foreign Debian architecture.
+override_dh_dwz:
+
+override_dh_strip:

@@ -1,27 +1,26 @@
 Source: rustdesk-server
 Section: net
 Priority: optional
-Maintainer: open-trade <info@rustdesk.com>
-Build-Depends: debhelper (>= 10), pkg-config
-Standards-Version: 4.5.0
-Homepage: https://rustdesk.com/
+Maintainer: XavierAlpha <52537840+XavierAlpha@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/XavierAlpha/rustdesk-server
 
 Package: rustdesk-server-hbbs
 Architecture: {{ ARCH }}
-Depends: systemd ${misc:Depends}
-Description: RustDesk server
- Self-host your own RustDesk server, it is free and open source.
+Depends: adduser, systemd, ${misc:Depends}, ${shlibs:Depends}
+Description: Camellia rendezvous server
+ Self-hosted Camellia device discovery and rendezvous service.
 
 Package: rustdesk-server-hbbr
 Architecture: {{ ARCH }}
-Depends: systemd ${misc:Depends}
-Description: RustDesk server
- Self-host your own RustDesk server, it is free and open source.
- This package contains the RustDesk relay server.
+Depends: adduser, systemd, ${misc:Depends}, ${shlibs:Depends}
+Description: Camellia relay server
+ Self-hosted Camellia encrypted connection relay service.
 
 Package: rustdesk-server-utils
 Architecture: {{ ARCH }}
-Depends: ${misc:Depends}
-Description: RustDesk server
- Self-host your own RustDesk server, it is free and open source.
- This package contains the rustdesk-utils binary.
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: Camellia server utilities
+ Diagnostic and key-management utilities for Camellia servers.
