@@ -28,6 +28,11 @@ three ways to set the same thing.
 For **`hbbr`** the precedence is: **flag** (`-b`, `-p`, `-k`) → **`.env`** →
 **inherited environment**.
 
+Configuration files must be UTF-8 regular files no larger than 1 MiB.
+Malformed, oversized, unreadable, or non-regular files stop startup; Unix
+symbolic links are rejected. A missing default `.env` is the only ignored
+file condition, while an explicitly requested `--config` file must exist.
+
 `RUST_LOG` is an exception to these rules. Both binaries initialize logging
 before loading `.env` (or `hbbs`'s `--config` file), so `RUST_LOG` must be set
 in the inherited process environment.
@@ -38,18 +43,26 @@ in the inherited process environment.
 
 | Variable | CLI flag | Default | Description |
 |---|---|---|---|
-| `KEY` | `-k`, `--key` | `-` | Public key clients must use, a base64 secret key, or `-` / `_` to load or generate a key pair (`id_ed25519`, `id_ed25519.pub`). `-` and `_` have the same behavior, so explicitly passing `-k _` to `hbbs` is unnecessary. An explicitly empty value disables key validation; see [Keys](#keys-and-encryption). |
+| `KEY` | `-k`, `--key` | `-` | A structurally valid base64 64-byte Ed25519 private key, or an empty value / `-` / `_` to load or atomically generate a key pair (`id_ed25519`, `id_ed25519.pub`). `hbbs` needs the private key to sign the secure rendezvous handshake; public-only values are rejected. Key validation cannot be disabled. |
 | `BIND` | `-b`, `--bind` | all interfaces | **Available since 1.1.17.** Local IPv4 or IPv6 address on which all `hbbs` TCP, UDP, and WebSocket listeners bind. This does not change the addresses advertised to clients. Supported by `--config`, `.env`, and the inherited environment. |
-| `PORT` | `-p`, `--port` | `21116` | Main TCP/UDP listening port. `hbbs` also binds `PORT-1` (NAT type test) and `PORT+2` (WebSocket). |
+| `API_SERVER` | `--api-server` | `http://127.0.0.1:<HBBS_PORT-2>` | Bare HTTP(S) origin for the built-in API gateway. Remote origins must use HTTPS; HTTP is accepted only for loopback. Credentials, paths, queries, and fragments are rejected. The gateway requires a secure rendezvous handshake and matching server key, canonicalizes allowed API paths, overwrites forwarded client-IP headers, and enforces bounded headers/body/concurrency/rate. |
+| `DEVICE_VERIFICATION_TOKEN` 🅴 | *(none)* | *(none)* | 32–512 character secret shared only with the API server for device-deployment verification. Required unless unmanaged mode is explicitly enabled. This value is read only from the inherited process environment; do not place it in flags or configuration files. |
+| `DEVICE_VERIFICATION_TOKEN_FILE` 🅴 | *(none)* | *(none)* | Path to a bounded regular file containing the verification secret; preferred for containers. Symbolic links are rejected on Unix. Kubernetes Secret keys must therefore be mounted as a single-file `subPath`, as in the included manifest. Mutually exclusive with `DEVICE_VERIFICATION_TOKEN`. |
+| `ALLOW_UNMANAGED_DEVICES` 🅴 | *(none)* | `N` | `Y` lets first-seen devices claim IDs without API approval. This weakens the managed deployment boundary and must be an explicit operator decision. |
+| `HBBS_PORT` | `-p`, `--port` | `21116` | Main TCP/UDP listening port. `hbbs` also binds `HBBS_PORT-1` (NAT type test) and `HBBS_PORT+2` (WebSocket). |
 | `RELAY-SERVERS` | `-r`, `--relay-servers` | *(empty)* | Optional relay server override handed to clients, as comma-separated `host` or `host:port` values. Leave empty when `hbbr` uses the same address as `hbbs` and the standard port `21117`; clients derive it automatically. Set this only when the relay uses a different IP/hostname or a non-standard port. |
 | `RMEM` | `-M`, `--rmem` | `0` (system default) | UDP receive‑buffer size in bytes. Raise the OS limit first: `sudo sysctl -w net.core.rmem_max=52428800`. |
 | *(config file)* | `-c`, `--config` | *(none)* | Path to an extra INI config file (see precedence above). |
-| `TEST_HBBS` 🅴 | *(none)* | *(auto)* | UDP self‑test target checked at start‑up. Set to `no` to skip the check (useful behind some NATs/proxies), or to an explicit `host:port`. |
 | `ALWAYS_USE_RELAY` 🅴 | *(none)* | `N` | `Y` forces every session through a relay (disables direct/hole‑punched connections). At runtime, send `always-use-relay Y` or `always-use-relay N` to the `hbbs` [loopback console](#runtime-console). |
 | `DB_URL` 🅴 | *(none)* | `./db_v2.sqlite3` | Path/URL of the SQLite database file. See [Database](#database). |
-| `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool. |
+| `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool; must be 1–32 or startup fails. Connections use WAL mode, full synchronous durability, foreign-key enforcement, and a bounded busy timeout. |
+| `MAX_RENDEZVOUS_CONNECTIONS` 🅴 | *(none)* | `4096` | Maximum concurrent TCP/WebSocket rendezvous connections; must be 64–65536. |
+| `MAX_CACHED_PEERS` 🅴 | *(none)* | `100000` | Maximum in-memory peer cache entries; must be 1024–1000000. Inactive entries are evicted periodically. |
+| `ENABLE_RUNTIME_CONSOLE` 🅴 | *(none)* | `N` | `Y` enables the unauthenticated loopback TCP console. Leave disabled in production; see [Runtime console](#runtime-console). |
 
-🅴 = set through the inherited process environment.
+🅴 = no command-line flag. Except for the direct secret called out above,
+these values may be set through `--config`, `.env`, or the inherited process
+environment.
 
 > `PORT_FOR_API` / `KEY_FOR_API` are only used by RustDesk Server **Pro** and its
 > API; they have no effect in the open‑source server.
@@ -60,9 +73,11 @@ in the inherited process environment.
 
 | Variable | CLI flag | Default | Description |
 |---|---|---|---|
-| `KEY` | `-k`, `--key` | *(empty)* | The empty default intentionally disables relay key validation, avoiding key-pair setup and mismatch failures. To enable relay key validation, use the same non-empty key as `hbbs`; `-` / `_` have the same behavior and load or generate a key pair. An empty key allows clients without a matching key to use the relay, so choose this tradeoff deliberately on an exposed server. |
+| `KEY` | `-k`, `--key` | *(empty)* | An empty value, `-`, or `_` loads or atomically generates the shared key pair. A public or base64 secret key selects that explicit key. Relay key validation cannot be disabled. |
 | `BIND` | `-b`, `--bind` | all interfaces | **Available since 1.1.17.** Local IPv4 or IPv6 address on which the relay TCP and WebSocket listeners bind. Supported by `.env` and the inherited environment; `hbbr` does not support `--config`. |
-| `PORT` | `-p`, `--port` | `21117` | Relay listening port. `hbbr` also binds `PORT+2` for WebSocket relay. **Note:** when set via the `PORT` env var (not `-p`), `hbbr` listens on `PORT + 1`, so a shared `PORT=21116` makes `hbbs`=21116 and `hbbr`=21117. |
+| `HBBR_PORT` | `-p`, `--port` | `21117` | Relay listening port. The environment variable and CLI flag have identical semantics; `hbbr` also binds `HBBR_PORT+2` for WebSocket relay. |
+| `MAX_RELAY_CONNECTIONS` | *(none)* | `8192` | Maximum concurrent relay TCP/WebSocket connections; must be 64–65536. Pending relay pairing is additionally capped globally and per source IP. |
+| `ENABLE_RUNTIME_CONSOLE` | *(none)* | `N` | `Y` enables the unauthenticated loopback TCP console. |
 
 ### Relay bandwidth / QoS
 
@@ -70,12 +85,16 @@ These have no CLI flag and can also be changed through the `hbbr`
 [loopback console](#runtime-console) (`tb`, `sb`, `ls`, `dt`, `t`, …; send `h`
 for help).
 
+Configured values are validated at startup. The downgrade threshold must be in
+the range `0.000001`–`1`, all durations and bandwidths must be positive, and
+`LIMIT_SPEED` cannot exceed `SINGLE_BANDWIDTH`.
+
 | Variable | Default | Unit | Description |
 |---|---|---|---|
 | `SINGLE_BANDWIDTH` | `128` | Mb/s | Normal maximum bandwidth for each relay connection. |
 | `TOTAL_BANDWIDTH` | `1024` | Mb/s | Aggregate bandwidth cap shared by all relay connections. |
 | `LIMIT_SPEED` | `32` | Mb/s | Per-connection cap applied after a connection is downgraded, and to IPs in `blacklist.txt`. |
-| `DOWNGRADE_THRESHOLD` | `0.66` | ratio (0–1) | Fraction of `SINGLE_BANDWIDTH` that a connection's lifetime-average throughput must exceed to trigger downgrade. |
+| `DOWNGRADE_THRESHOLD` | `0.66` | ratio (0.000001–1) | Fraction of `SINGLE_BANDWIDTH` that a connection's lifetime-average throughput must exceed to trigger downgrade. Values use six-decimal precision. |
 | `DOWNGRADE_START_CHECK` | `1800` | seconds | Delay before a connection becomes eligible for the lifetime-average downgrade check. |
 
 Downgrade is decided independently for each connection; it does **not** check
@@ -97,23 +116,29 @@ These may also be placed in `.env` using the uppercase spellings shown above
 * **`blocklist.txt`** — IPs that are **refused** outright.
 
 Both can also be edited live through the `hbbr` loopback console (`ba`/`br`,
-`Ba`/`Br`).
+`Ba`/`Br`). Files are limited to 1 MiB and 65,536 canonical IP entries. Blank
+lines and `#` comments are accepted; an unreadable file, invalid first token,
+invalid UTF-8, or an exceeded limit stops startup rather than silently
+discarding policy.
 
 ### Runtime console
 
-The runtime consoles are TCP command transports built into the services; they
-are not `rustdesk-utils` commands or interactive standard-input consoles. A
-connection from a loopback address is treated as a single console command:
+The runtime consoles are disabled by default because any local process could
+otherwise mutate live server policy without authentication. They are TCP
+command transports, not `rustdesk-utils` commands or interactive
+standard-input consoles. Only after explicitly setting
+`ENABLE_RUNTIME_CONSOLE=Y` is a loopback connection treated as one command:
 
 ```bash
-# hbbs: toggle forced relay on PORT-1 (21115 by default)
+# hbbs: toggle forced relay on HBBS_PORT-1 (21115 by default)
 printf 'always-use-relay Y' | nc 127.0.0.1 21115
 
-# hbbr: list commands on its relay PORT (21117 by default)
+# hbbr: list commands on HBBR_PORT (21117 by default)
 printf 'h' | nc 127.0.0.1 21117
 ```
 
-Use the corresponding configured ports if you changed `PORT`.
+Use the corresponding configured ports if you changed `HBBS_PORT` or
+`HBBR_PORT`.
 
 ---
 
@@ -121,12 +146,8 @@ Use the corresponding configured ports if you changed `PORT`.
 
 At runtime the database location comes from **`DB_URL`** (default
 `./db_v2.sqlite3`). If unset, `hbbs` creates the SQLite file in its working
-directory.
-
-> **Do not confuse `DB_URL` with `DATABASE_URL`.** The `DATABASE_URL` entry in
-> the repository's `.env` is used **only at compile time** by `sqlx` to check SQL
-> queries; it is **not** read by the running server. Setting `DATABASE_URL` on a
-> running server has no effect — use `DB_URL`.
+directory. Builds do not require a pre-created database or a compile-time
+`DATABASE_URL`.
 
 ---
 
@@ -145,27 +166,27 @@ RUST_LOG=debug hbbs
 
 ## Keys and encryption
 
-The `KEY` / `-k` value can be:
+For `hbbr`, the `KEY` / `-k` value can be:
 
-* a **public key** string — clients must present the matching key;
-* a **base64‑encoded 64‑byte secret key** — the server derives the public key
-  from it;
+* a **base64-encoded 32-byte Ed25519 public key** — clients must present the
+  matching key;
+* a **structurally valid base64-encoded 64-byte Ed25519 private key** — the
+  server derives the public key from it;
 * **`-` or `_`** — the server loads a key pair from the working directory or
   generates one on first start, writing `id_ed25519` (private) and
   `id_ed25519.pub` (public);
-* **empty** — key validation is disabled. `hbbs` still loads or generates key
-  files for signing but deliberately leaves its active validation key empty;
-  `hbbr` neither loads nor generates a key. Both services then accept clients
-  without validating a key. This is the intentional `hbbr` default; use a
-  non-empty value when relay key validation is required.
+* **empty** — the same safe load-or-generate behavior as `-` / `_`; it does not
+  disable validation.
 
-`hbbs` defaults to `-`, so it already loads or generates a key pair without an
-explicit `-k _`. `hbbr` intentionally defaults to an empty key to avoid
-key-pair setup and mismatch failures. Leave it empty for the default mode
-without key validation. To enable relay key validation, give it the same
-non-empty key as `hbbs`; both services can reuse key material from a shared
-working directory. The `_` value is not a stricter mode than `-` in the current
-implementation.
+`hbbs` accepts the load-or-generate values above or a structurally valid
+base64-encoded 64-byte Ed25519 private key; it deliberately rejects public-only
+configuration because it signs the secure rendezvous handshake. `hbbs`
+defaults to `-`; `hbbr` defaults to the equivalent empty value. Both therefore
+load or generate keys and enforce validation without extra flags.
+Run both services from the same working directory (or mount the same key
+volume) so they use identical material. Key creation is atomic across
+concurrent starts, the private file is forced to `0600` on Unix, and malformed
+or unwritable material fails startup.
 
 To supply your own key pair, place `id_ed25519` and `id_ed25519.pub` in the
 process's **current working directory** before first start. That directory may
@@ -176,23 +197,25 @@ image, the working directory is `/data`.
 
 ## Docker image variables
 
-The supervisor image (`rustdesk/rustdesk-server-s6`) starts both binaries with
-s6 and adds a few convenience variables handled by its service scripts, **not**
-by `hbbs`/`hbbr` directly:
+The supervisor image (`ghcr.io/xavieralpha/rustdesk-server-s6`) starts both
+binaries as the unprivileged `nobody` account under a root s6 supervisor. It
+adds a few convenience variables handled by its service scripts, **not** by
+`hbbs`/`hbbr` directly:
 
 | Variable | Default | Description |
 |---|---|---|
-| `RELAY` | `relay.example.com` | Passed to `hbbs` as `-r $RELAY` (your public address). |
-| `ENCRYPTED_ONLY` | `0` | `1` adds `-k _` to both servers. This is redundant for `hbbs`, whose default is `-`, and opts `hbbr` into key validation instead of its intentional empty default. |
-| `KEY_PUB` | *(unset)* | If set, written to `/data/id_ed25519.pub` on first start. |
-| `KEY_PRIV` | *(unset)* | If set, written to `/data/id_ed25519` on first start. Provide **both** `KEY_PUB` and `KEY_PRIV`, or neither. |
+| `RELAY` | *(required)* | Passed to `hbbs` as `-r $RELAY`. Startup fails unless this is the externally reachable relay `host:port`. |
+| `S6_READ_ONLY_ROOT` | `0` | Set to `1` when the container uses a read-only root filesystem, and mount a writable tmpfs at `/run`. |
+| Docker secret `key_pub` | *(unset)* | If mounted at `/run/secrets/key_pub`, copied to `/data/id_ed25519.pub` on first start. |
+| Docker secret `key_priv` | *(unset)* | If mounted at `/run/secrets/key_priv`, copied atomically to `/data/id_ed25519` on first start. The public half is derived when `key_pub` is omitted. A public secret without a private secret is rejected. Private keys are intentionally not accepted through environment variables or process arguments. |
 
 Any variable from the tables above can also be passed straight through the
 container's environment (e.g. `-e ALWAYS_USE_RELAY=Y`, `-e RUST_LOG=debug`).
 
-The classic scratch image (`rustdesk/rustdesk-server`) contains only the
-binaries and does **not** implement `RELAY`, `ENCRYPTED_ONLY`, `KEY_PUB`, or
-`KEY_PRIV`; those variables are ignored by that image.
+The classic scratch image (`ghcr.io/xavieralpha/rustdesk-server`) contains only
+the binaries, runs as UID/GID `10001`, and uses `/data` as its working
+directory. It does **not** implement the supervisor conveniences or Docker
+secret bootstrap.
 
 ---
 
@@ -209,9 +232,10 @@ hbbr -p 22117
 ### `.env` file (working directory)
 
 ```ini
-# Non-standard ports shared by both binaries; hbbr listens on PORT+1.
+# Non-standard ports shared through one working-directory configuration.
 relay-servers=rustdesk.example.com:22117
-PORT=22116
+HBBS_PORT=22116
+HBBR_PORT=22117
 ```
 
 ### docker-compose
@@ -219,12 +243,17 @@ PORT=22116
 ```yaml
 services:
   rustdesk-server:
-    image: rustdesk/rustdesk-server-s6:latest
+    image: ghcr.io/xavieralpha/rustdesk-server-s6@sha256:<digest>
     environment:
       - RELAY=rustdesk.example.com:21117
+      - API_SERVER=https://api.example.com
+      - DEVICE_VERIFICATION_TOKEN_FILE=/run/secrets/device_verification_token
       - ALWAYS_USE_RELAY=Y
       - RUST_LOG=info
+      - S6_READ_ONLY_ROOT=1
       - SINGLE_BANDWIDTH=256
+    secrets:
+      - device_verification_token
     ports:
       - "21115:21115"
       - "21116:21116"
@@ -232,17 +261,45 @@ services:
       - "21117:21117"
       - "21118:21118"
       - "21119:21119"
-    volumes: ["./data:/data"]
+    volumes: ["camellia-data:/data"]
+    read_only: true
+    tmpfs:
+      - /run:size=16m,mode=0755
+      - /tmp:size=16m,mode=1777
     restart: unless-stopped
+
+volumes:
+  camellia-data:
+
+secrets:
+  device_verification_token:
+    file: /secure/device-verification-token
 ```
 
 ### systemd
 
+The Debian units run as the dedicated `camellia-server` user and read
+`/etc/default/camellia-server`. `rustdesk-hbbs.service` is deliberately skipped
+until that file exists and is non-empty, so a package install cannot expose an
+unconfigured managed-device endpoint. Start from the packaged example and
+replace every `.invalid` value:
+
 ```ini
-[Service]
-Environment=ALWAYS_USE_RELAY=Y
-Environment=RUST_LOG=info
-ExecStart=/usr/bin/hbbs
+API_SERVER=https://api.example.com
+DEVICE_VERIFICATION_TOKEN_FILE=/etc/camellia-server/device-verification-token
+RELAY_SERVERS=rustdesk.example.com:21117
+ALWAYS_USE_RELAY=Y
+RUST_LOG=info
+```
+
+Store the token file as `root:camellia-server` with mode `0640`. Both services
+share `/var/lib/rustdesk-server`; package removal deliberately preserves this
+directory so uninstalling one service cannot erase the other's key material.
+After validating the API origin, relay address, and shared secret, enable and
+start both units:
+
+```bash
+sudo systemctl enable --now rustdesk-hbbs.service rustdesk-hbbr.service
 ```
 
 ---
@@ -251,11 +308,11 @@ ExecStart=/usr/bin/hbbs
 
 | Port | Proto | Server | Purpose |
 |---|---|---|---|
-| 21115 | TCP | hbbs | NAT type test (`PORT-1`) |
-| 21116 | TCP + UDP | hbbs | ID registration / rendezvous / hole punching (`PORT`) |
-| 21117 | TCP | hbbr | Relay (`hbbr PORT`) |
-| 21118 | TCP | hbbs | WebSocket rendezvous (`PORT+2`) |
-| 21119 | TCP | hbbr | WebSocket relay (`hbbr PORT+2`) |
+| 21115 | TCP | hbbs | NAT type test (`HBBS_PORT-1`) |
+| 21116 | TCP + UDP | hbbs | ID registration / rendezvous / hole punching (`HBBS_PORT`) |
+| 21117 | TCP | hbbr | Relay (`HBBR_PORT`) |
+| 21118 | TCP | hbbs | WebSocket rendezvous (`HBBS_PORT+2`) |
+| 21119 | TCP | hbbr | WebSocket relay (`HBBR_PORT+2`) |
 
 Ports 21118/21119 are only needed for the web client; you can omit them
 otherwise.
