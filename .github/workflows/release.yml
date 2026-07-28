@@ -519,7 +519,9 @@ jobs:
       - name: Install packaging tools
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y debhelper
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            debhelper
 
       - name: Download Linux binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -532,14 +534,9 @@ jobs:
           DEB_ARCH: ${{ matrix.deb_arch }}
           MATRIX_NAME: ${{ matrix.name }}
         run: |
-          chmod 0755 "debian-build/$MATRIX_NAME/bin/hbbs" \
-            "debian-build/$MATRIX_NAME/bin/hbbr" \
-            "debian-build/$MATRIX_NAME/bin/rustdesk-utils"
-          cp -R debian "debian-build/$MATRIX_NAME/"
-          sed "s/{{ ARCH }}/${DEB_ARCH}/" debian/control.tpl \
-            > "debian-build/$MATRIX_NAME/debian/control"
-          cd "debian-build/$MATRIX_NAME"
-          dpkg-buildpackage --build=binary --no-sign -a"$DEB_ARCH"
+          debian/build-packages.sh \
+            --architecture "$DEB_ARCH" \
+            --workspace "debian-build/$MATRIX_NAME"
 
       - name: Upload Debian packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

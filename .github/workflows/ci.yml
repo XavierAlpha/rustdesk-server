@@ -155,6 +155,7 @@ jobs:
       - name: Lint container scripts
         run: |
           shellcheck \
+            debian/build-packages.sh \
             docker/rootfs/usr/bin/healthcheck.sh \
             docker/rootfs/etc/s6-overlay/s6-rc.d/hbbr/finish \
             docker/rootfs/etc/s6-overlay/s6-rc.d/hbbr/run \
@@ -166,6 +167,7 @@ jobs:
 
       - name: Verify executable deployment scripts
         run: |
+          test -x debian/build-packages.sh
           test -x docker/rootfs/usr/bin/healthcheck.sh
           test -x docker/rootfs/etc/s6-overlay/s6-rc.d/hbbr/finish
           test -x docker/rootfs/etc/s6-overlay/s6-rc.d/hbbr/run
@@ -191,39 +193,12 @@ jobs:
 
           package_root="$RUNNER_TEMP/camellia-debian-fixture"
           install -d "$package_root/bin"
-          cp -R debian "$package_root/"
           install -m 0755 /bin/true "$package_root/bin/hbbs"
           install -m 0755 /bin/true "$package_root/bin/hbbr"
           install -m 0755 /bin/true "$package_root/bin/rustdesk-utils"
-          sed "s/{{ ARCH }}/$(dpkg --print-architecture)/" debian/control.tpl \
-            > "$package_root/debian/control"
-
-          (
-            cd "$package_root"
-            dpkg-buildpackage --build=binary --no-sign
-          )
-
-          mapfile -t packages < <(
-            find "$RUNNER_TEMP" -maxdepth 1 -type f \
-              -name 'rustdesk-server-*.deb' -print
-          )
-          test "${#packages[@]}" -eq 3
-          for package in "${packages[@]}"; do
-            dpkg-deb --info "$package" >/dev/null
-          done
-          dpkg-deb --contents "$RUNNER_TEMP"/rustdesk-server-hbbs_*.deb \
-            | grep -E '\./(usr/)?lib/systemd/system/rustdesk-hbbs\.service$' >/dev/null
-          dpkg-deb --contents "$RUNNER_TEMP"/rustdesk-server-hbbr_*.deb \
-            | grep -E '\./(usr/)?lib/systemd/system/rustdesk-hbbr\.service$' >/dev/null
-          dpkg-deb --fsys-tarfile "$RUNNER_TEMP"/rustdesk-server-hbbs_*.deb \
-            | tar -xOf - ./usr/bin/hbbs \
-            | cmp - "$package_root/bin/hbbs"
-          dpkg-deb --fsys-tarfile "$RUNNER_TEMP"/rustdesk-server-hbbr_*.deb \
-            | tar -xOf - ./usr/bin/hbbr \
-            | cmp - "$package_root/bin/hbbr"
-          dpkg-deb --fsys-tarfile "$RUNNER_TEMP"/rustdesk-server-utils_*.deb \
-            | tar -xOf - ./usr/bin/rustdesk-utils \
-            | cmp - "$package_root/bin/rustdesk-utils"
+          debian/build-packages.sh \
+            --architecture "$(dpkg --print-architecture)" \
+            --workspace "$package_root"
 
       - name: Lint Dockerfiles
         run: |
