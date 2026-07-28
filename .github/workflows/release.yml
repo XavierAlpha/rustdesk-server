@@ -1,109 +1,156 @@
-name: release
+name: Release
 
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing release tag (for example, v1.2.3)
-        required: true
+      source_ref:
+        description: Commit or ref reachable from the default branch; blank uses the default branch
+        required: false
         type: string
-  push:
-    tags:
-      - "v*.*.*"
-      - "*.*.*"
+        default: ""
+      publish:
+        description: Publish images, tag, and GitHub release after the build succeeds
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: release-${{ github.repository }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  group: server-release
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  GHCR_IMAGE: ghcr.io/xavieralpha/rustdesk-server-s6
-  GHCR_IMAGE_CLASSIC: ghcr.io/xavieralpha/rustdesk-server
 
 jobs:
   validate-release-tag:
     name: Validate release source
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       commit: ${{ steps.release.outputs.commit }}
       source_date_epoch: ${{ steps.release.outputs.source_date_epoch }}
-      tag: ${{ steps.release.outputs.tag }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      ci_run_id: ${{ steps.release.outputs.ci_run_id }}
+      ghcr_image: ${{ steps.release.outputs.ghcr_image }}
+      ghcr_image_classic: ${{ steps.release.outputs.ghcr_image_classic }}
+      hbb_common: ${{ steps.release.outputs.hbb_common }}
 
     steps:
       - name: Checkout release metadata
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ inputs.source_ref || github.event.repository.default_branch }}
           fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
-      - name: Resolve immutable tag
-        id: release
-        env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Test and validate component version
+        id: metadata
         run: |
-          if [[ ! "$RELEASE_TAG" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
-            echo "Invalid semantic-version release tag: $RELEASE_TAG" >&2
-            exit 1
-          fi
-          if ! commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"; then
-            echo "Release tag does not exist: $RELEASE_TAG" >&2
+          python scripts/test_release_metadata.py
+          python scripts/release_metadata.py --github-output
+
+      - name: Resolve verified release source
+        id: release
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          commit="$(git rev-parse HEAD)"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          if ! git merge-base --is-ancestor "$commit" "origin/$DEFAULT_BRANCH"; then
+            echo "release source $commit is not reachable from $DEFAULT_BRANCH" >&2
             exit 1
           fi
 
-          release_version=${RELEASE_TAG#v}
-          cargo_manifest="$RUNNER_TEMP/release-Cargo.toml"
-          debian_changelog="$RUNNER_TEMP/release-debian-changelog"
-          git show "$commit:Cargo.toml" > "$cargo_manifest"
-          git show "$commit:debian/changelog" > "$debian_changelog"
-          cargo_version=$(
-            python3 - "$cargo_manifest" <<'PY'
-          import sys
-          import tomllib
-
-          with open(sys.argv[1], "rb") as manifest:
-              print(tomllib.load(manifest)["package"]["version"])
-          PY
-          )
-          debian_version=$(
-            dpkg-parsechangelog \
-              --file "$debian_changelog" \
-              --show-field Version
-          )
-          if [[ "$cargo_version" != "$release_version" ]]; then
-            echo "Tag version $release_version does not match Cargo version $cargo_version" >&2
-            exit 1
+          if [[ "$PUBLISH" == "true" ]]; then
+            for candidate_tag in "$RELEASE_TAG" "$VERSION"; do
+              if git ls-remote --exit-code --tags origin "refs/tags/$candidate_tag" >/dev/null 2>&1; then
+                echo "release version already has a tag: $candidate_tag" >&2
+                exit 1
+              fi
+            done
           fi
-          if [[ "$debian_version" != "$release_version" ]]; then
-            echo "Tag version $release_version does not match Debian version $debian_version" >&2
+
+          runs_json="$(
+            gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+              -f head_sha="$commit" \
+              -f event=push \
+              -f status=success \
+              -f per_page=100
+          )"
+          ci_run_id="$(
+            jq -r --arg commit "$commit" \
+              '[.workflow_runs[] | select(.head_sha == $commit and .conclusion == "success")] | sort_by(.run_number) | last | .id // empty' \
+              <<< "$runs_json"
+          )"
+          if [[ -z "$ci_run_id" ]]; then
+            echo "no successful push CI run exists for $commit" >&2
             exit 1
           fi
           source_date_epoch=$(git show -s --format=%ct "$commit")
+          repository_lower="${GITHUB_REPOSITORY,,}"
+          hbb_common="$(git ls-tree "$commit" -- libs/hbb_common | awk '$2 == "commit" { print $3 }')"
+          if [[ ! "$hbb_common" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release source does not pin one full hbb_common commit" >&2
+            exit 1
+          fi
 
           {
             echo "commit=$commit"
+            echo "ci_run_id=$ci_run_id"
+            echo "ghcr_image=ghcr.io/${repository_lower}-s6"
+            echo "ghcr_image_classic=ghcr.io/${repository_lower}"
+            echo "hbb_common=$hbb_common"
             echo "source_date_epoch=$source_date_epoch"
-            echo "tag=$RELEASE_TAG"
           } >> "$GITHUB_OUTPUT"
 
-  quality:
-    name: Quality gates
+      - name: Summarize release candidate
+        env:
+          CI_RUN_ID: ${{ steps.release.outputs.ci_run_id }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          {
+            echo "### Server release candidate"
+            echo
+            echo "- Version: \`$VERSION\` (\`$RELEASE_TAG\`)"
+            echo "- Commit: \`$RELEASE_COMMIT\`"
+            echo "- Reused CI run: \`$CI_RUN_ID\`"
+            echo "- Publish: \`$PUBLISH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  approval:
+    name: Approve production release
+    if: inputs.publish
     needs: validate-release-tag
-    uses: ./.github/workflows/quality.yml
-    with:
-      ref: ${{ needs.validate-release-tag.outputs.commit }}
-    permissions:
-      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    steps:
+      - name: Record approval gate
+        run: echo "Production release approved for ${{ needs.validate-release-tag.outputs.tag }}"
 
   build-linux:
     name: Build Linux (${{ matrix.name }})
+    if: >-
+      always() &&
+      needs.validate-release-tag.result == 'success' &&
+      (needs.approval.result == 'success' || needs.approval.result == 'skipped')
     needs:
       - validate-release-tag
-      - quality
+      - approval
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -169,9 +216,13 @@ jobs:
 
   build-windows:
     name: Build Windows (x86_64)
+    if: >-
+      always() &&
+      needs.validate-release-tag.result == 'success' &&
+      (needs.approval.result == 'success' || needs.approval.result == 'skipped')
     needs:
       - validate-release-tag
-      - quality
+      - approval
     runs-on: windows-2025
     timeout-minutes: 45
 
@@ -211,10 +262,9 @@ jobs:
           retention-days: 7
 
   docker-s6:
-    name: Publish s6 image (${{ matrix.name }})
+    name: Build s6 image (${{ matrix.name }})
     needs:
       - validate-release-tag
-      - quality
       - build-linux
       - build-windows
       - deb-package
@@ -268,26 +318,27 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to GHCR
+        if: inputs.publish
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push s6 image
+      - name: Build and optionally publish s6 image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         env:
           SOURCE_DATE_EPOCH: ${{ needs.validate-release-tag.outputs.source_date_epoch }}
         with:
           context: docker
           platforms: ${{ matrix.platform }}
-          push: true
+          push: ${{ inputs.publish }}
           provenance: mode=max
           sbom: true
           build-args: |
             S6_ARCH=${{ matrix.s6_arch }}
             S6_ARCH_SHA256=${{ matrix.s6_sha256 }}
-          tags: ${{ env.GHCR_IMAGE }}:${{ needs.validate-release-tag.outputs.tag }}-${{ matrix.name }}
+          tags: ${{ needs.validate-release-tag.outputs.ghcr_image }}:${{ needs.validate-release-tag.outputs.tag }}-${{ matrix.name }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate-release-tag.outputs.commit }}
@@ -295,6 +346,7 @@ jobs:
 
   docker-s6-manifest:
     name: Publish s6 multi-architecture manifest
+    if: inputs.publish
     needs:
       - validate-release-tag
       - docker-s6
@@ -317,20 +369,21 @@ jobs:
 
       - name: Create versioned manifest
         env:
+          GHCR_IMAGE: ${{ needs.validate-release-tag.outputs.ghcr_image }}
           RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
         run: |
           docker buildx imagetools create \
             --tag "${GHCR_IMAGE}:${RELEASE_TAG}" \
+            --tag "${GHCR_IMAGE}:latest" \
             "${GHCR_IMAGE}:${RELEASE_TAG}-amd64" \
             "${GHCR_IMAGE}:${RELEASE_TAG}-arm64v8" \
             "${GHCR_IMAGE}:${RELEASE_TAG}-armv7" \
             "${GHCR_IMAGE}:${RELEASE_TAG}-i386"
 
   docker-classic:
-    name: Publish classic image (${{ matrix.name }})
+    name: Build classic image (${{ matrix.name }})
     needs:
       - validate-release-tag
-      - quality
       - build-linux
       - build-windows
       - deb-package
@@ -376,23 +429,24 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to GHCR
+        if: inputs.publish
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push classic image
+      - name: Build and optionally publish classic image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         env:
           SOURCE_DATE_EPOCH: ${{ needs.validate-release-tag.outputs.source_date_epoch }}
         with:
           context: docker-classic
           platforms: ${{ matrix.platform }}
-          push: true
+          push: ${{ inputs.publish }}
           provenance: mode=max
           sbom: true
-          tags: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ needs.validate-release-tag.outputs.tag }}-${{ matrix.name }}
+          tags: ${{ needs.validate-release-tag.outputs.ghcr_image_classic }}:${{ needs.validate-release-tag.outputs.tag }}-${{ matrix.name }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate-release-tag.outputs.commit }}
@@ -400,6 +454,7 @@ jobs:
 
   docker-classic-manifest:
     name: Publish classic multi-architecture manifest
+    if: inputs.publish
     needs:
       - validate-release-tag
       - docker-classic
@@ -422,10 +477,12 @@ jobs:
 
       - name: Create versioned manifest
         env:
+          GHCR_IMAGE_CLASSIC: ${{ needs.validate-release-tag.outputs.ghcr_image_classic }}
           RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
         run: |
           docker buildx imagetools create \
             --tag "${GHCR_IMAGE_CLASSIC}:${RELEASE_TAG}" \
+            --tag "${GHCR_IMAGE_CLASSIC}:latest" \
             "${GHCR_IMAGE_CLASSIC}:${RELEASE_TAG}-amd64" \
             "${GHCR_IMAGE_CLASSIC}:${RELEASE_TAG}-arm64v8" \
             "${GHCR_IMAGE_CLASSIC}:${RELEASE_TAG}-armv7" \
@@ -435,7 +492,6 @@ jobs:
     name: Build Debian packages (${{ matrix.name }})
     needs:
       - validate-release-tag
-      - quality
       - build-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -495,6 +551,7 @@ jobs:
 
   release:
     name: Publish GitHub release
+    if: inputs.publish
     needs:
       - validate-release-tag
       - build-linux
@@ -516,17 +573,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ needs.validate-release-tag.outputs.commit }}
-
-      - name: Verify release tag is unchanged
-        env:
-          RELEASE_COMMIT: ${{ needs.validate-release-tag.outputs.commit }}
-          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
-        run: |
-          current_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
-          if [[ "$current_commit" != "$RELEASE_COMMIT" ]]; then
-            echo "Release tag moved during the workflow" >&2
-            exit 1
-          fi
 
       - name: Download binary artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -550,16 +596,41 @@ jobs:
           done
 
       - name: Package release files
+        env:
+          CI_RUN_ID: ${{ needs.validate-release-tag.outputs.ci_run_id }}
+          GHCR_IMAGE: ${{ needs.validate-release-tag.outputs.ghcr_image }}
+          GHCR_IMAGE_CLASSIC: ${{ needs.validate-release-tag.outputs.ghcr_image_classic }}
+          HBB_COMMON_COMMIT: ${{ needs.validate-release-tag.outputs.hbb_common }}
+          RELEASE_COMMIT: ${{ needs.validate-release-tag.outputs.commit }}
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+          VERSION: ${{ needs.validate-release-tag.outputs.version }}
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import hashlib
+          import json
+          import os
           import shutil
           import stat
           import zipfile
 
           output = Path("release")
           output.mkdir()
+          metadata = {
+              "version": os.environ["VERSION"],
+              "tag": os.environ["RELEASE_TAG"],
+              "source_commit": os.environ["RELEASE_COMMIT"],
+              "hbb_common_commit": os.environ["HBB_COMMON_COMMIT"],
+              "verified_ci_run_id": int(os.environ["CI_RUN_ID"]),
+              "images": [
+                  os.environ["GHCR_IMAGE"],
+                  os.environ["GHCR_IMAGE_CLASSIC"],
+              ],
+          }
+          (output / "release-metadata.json").write_text(
+              json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
 
           def archive(source: Path, destination: Path, names: tuple[str, ...]) -> None:
               with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
@@ -611,6 +682,7 @@ jobs:
           draft: false
           fail_on_unmatched_files: true
           generate_release_notes: true
-          prerelease: ${{ contains(needs.validate-release-tag.outputs.tag, '-') }}
+          prerelease: false
           tag_name: ${{ needs.validate-release-tag.outputs.tag }}
+          target_commitish: ${{ needs.validate-release-tag.outputs.commit }}
           files: release/*

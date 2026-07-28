@@ -104,6 +104,37 @@ former Windows GUI/NSIS bundle was retired because it installed an embedded,
 unverifiable service wrapper as `LocalSystem`; it is not a production-safe
 service boundary.
 
+## CI and releases
+
+`CI` is the single validation entry point for pull requests, `master` pushes,
+and manual reruns. Documentation-only changes run the classifier, component
+version check, and stable `CI / Required` gate. Runtime changes also validate
+deployment configuration, run the complete Linux Rust gates, and compile and
+test on Windows. Dependency pull requests additionally review the dependency
+graph delta. Superseded pull-request runs are cancelled; default-branch runs
+are retained as release evidence.
+
+`Release` is manually dispatched and derives the canonical
+`vMAJOR.MINOR.PATCH` tag from the server's independent version. The selected
+commit must be reachable from the repository's default branch and have a
+successful push `CI` run. Release jobs then build production binaries,
+packages, and images without rerunning quality tests. `publish=false` is the
+safe dry-run default. A published run passes the `release` environment gate,
+pushes same-owner GHCR images derived from the current repository name, and
+creates the tag, attested artifacts, checksums, and GitHub Release only after
+all builds succeed.
+
+Before release, update the `hbbs` version in `Cargo.toml` and `Cargo.lock` and
+the first `debian/changelog` entry together, then run:
+
+```bash
+python scripts/test_release_metadata.py
+python scripts/release_metadata.py
+```
+
+The validator accepts only a consistent stable SemVer. Client, server, and API
+versions are intentionally independent.
+
 ## License and attribution
 
 Fork of [RustDesk Server OSS](https://github.com/rustdesk/rustdesk-server)
