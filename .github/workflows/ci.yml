@@ -193,9 +193,12 @@ jobs:
 
           package_root="$RUNNER_TEMP/camellia-debian-fixture"
           install -d "$package_root/bin"
-          install -m 0755 /bin/true "$package_root/bin/hbbs"
-          install -m 0755 /bin/true "$package_root/bin/hbbr"
-          install -m 0755 /bin/true "$package_root/bin/rustdesk-utils"
+          server_stub="$RUNNER_TEMP/camellia-server-static-stub"
+          printf '%s\n' 'int main(void) { return 0; }' \
+            | cc -static -s -x c -o "$server_stub" -
+          install -m 0755 "$server_stub" "$package_root/bin/hbbs"
+          install -m 0755 "$server_stub" "$package_root/bin/hbbr"
+          install -m 0755 "$server_stub" "$package_root/bin/rustdesk-utils"
           debian/build-packages.sh \
             --architecture "$(dpkg --print-architecture)" \
             --workspace "$package_root"

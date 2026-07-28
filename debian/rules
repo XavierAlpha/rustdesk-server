@@ -6,9 +6,14 @@ override_dh_installsystemd:
 	dh_installsystemd --package=rustdesk-server-hbbs --name=rustdesk-hbbs
 	dh_installsystemd --package=rustdesk-server-hbbr --name=rustdesk-hbbr
 
-# Cargo already strips the release executables. Preserve those exact artifacts
-# in every package and avoid requiring target-specific binutils when wrapping
-# a prebuilt binary for a foreign Debian architecture.
+# The packaging helper rejects non-ELF, wrong-architecture, and dynamically
+# linked inputs. Cargo already strips the verified static executables, so keep
+# those exact artifacts and do not require target-specific binutils merely to
+# wrap them for a foreign Debian architecture.
+override_dh_makeshlibs:
+
+override_dh_shlibdeps:
+
 override_dh_dwz:
 
 override_dh_strip:
