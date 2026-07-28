@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       runtime: ${{ steps.changes.outputs.runtime }}
+      deployment: ${{ steps.changes.outputs.deployment }}
       dependencies: ${{ steps.changes.outputs.dependencies }}
     steps:
       - name: Checkout
@@ -44,10 +45,12 @@ jobs:
           PUSH_HEAD_SHA: ${{ github.sha }}
         run: |
           runtime=false
+          deployment=false
           dependencies=false
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             runtime=true
+            deployment=true
           else
             if [[ "$EVENT_NAME" == "pull_request" ]]; then
               base="$PR_BASE_SHA"
@@ -64,10 +67,15 @@ jobs:
             git diff --name-only -z "$base" "$head" > "$changed_paths"
             while IFS= read -r -d '' path; do
               case "$path" in
-                README.md|README_EN.md|docs/*|LICENSE|LICENSE.*|.github/ISSUE_TEMPLATE/*)
+                README.md|README_EN.md|docs/*|LICENSE|LICENSE.*|.github/ISSUE_TEMPLATE/*|.github/*|docker/*|docker-classic/*|debian/*|docker-compose*.yml|docker-compose*.yaml|kubernetes/*)
                   ;;
                 *)
                   runtime=true
+                  ;;
+              esac
+              case "$path" in
+                .github/*|docker/*|docker-classic/*|debian/*|docker-compose*.yml|docker-compose*.yaml|kubernetes/*)
+                  deployment=true
                   ;;
               esac
               case "$path" in
@@ -80,12 +88,14 @@ jobs:
 
           {
             echo "runtime=$runtime"
+            echo "deployment=$deployment"
             echo "dependencies=$dependencies"
           } >> "$GITHUB_OUTPUT"
           {
             echo "### Change classification"
             echo
-            echo "- Runtime validation: \`$runtime\`"
+            echo "- Rust validation: \`$runtime\`"
+            echo "- Deployment validation: \`$deployment\`"
             echo "- Dependency review: \`$dependencies\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -127,7 +137,7 @@ jobs:
 
   workflow:
     name: Workflow and deployment configuration
-    if: needs.classify.outputs.runtime == 'true'
+    if: needs.classify.outputs.deployment == 'true'
     needs: classify
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -352,6 +362,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           RUNTIME_REQUIRED: ${{ needs.classify.outputs.runtime }}
+          DEPLOYMENT_REQUIRED: ${{ needs.classify.outputs.deployment }}
           DEPENDENCIES_CHANGED: ${{ needs.classify.outputs.dependencies }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           METADATA_RESULT: ${{ needs.metadata.result }}
@@ -372,8 +383,10 @@ jobs:
 
           require_success "change classification" "$CLASSIFY_RESULT"
           require_success "component version validation" "$METADATA_RESULT"
-          if [[ "$RUNTIME_REQUIRED" == "true" ]]; then
+          if [[ "$DEPLOYMENT_REQUIRED" == "true" ]]; then
             require_success "workflow and deployment validation" "$WORKFLOW_RESULT"
+          fi
+          if [[ "$RUNTIME_REQUIRED" == "true" ]]; then
             require_success "Rust quality" "$RUST_RESULT"
             require_success "Windows validation" "$WINDOWS_RESULT"
           fi
