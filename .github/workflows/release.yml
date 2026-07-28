@@ -263,6 +263,12 @@ jobs:
 
   docker-s6:
     name: Build s6 image (${{ matrix.name }})
+    if: >-
+      always() &&
+      needs.validate-release-tag.result == 'success' &&
+      needs.build-linux.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.deb-package.result == 'success'
     needs:
       - validate-release-tag
       - build-linux
@@ -382,6 +388,12 @@ jobs:
 
   docker-classic:
     name: Build classic image (${{ matrix.name }})
+    if: >-
+      always() &&
+      needs.validate-release-tag.result == 'success' &&
+      needs.build-linux.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.deb-package.result == 'success'
     needs:
       - validate-release-tag
       - build-linux
@@ -490,6 +502,13 @@ jobs:
 
   deb-package:
     name: Build Debian packages (${{ matrix.name }})
+    # The approval ancestor is intentionally skipped for publish=false. Use an
+    # explicit result condition so GitHub does not propagate that skip into a
+    # side-effect-free release validation run.
+    if: >-
+      always() &&
+      needs.validate-release-tag.result == 'success' &&
+      needs.build-linux.result == 'success'
     needs:
       - validate-release-tag
       - build-linux
