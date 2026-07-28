@@ -574,6 +574,19 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.validate-release-tag.outputs.commit }}
 
+      - name: Recheck release tag immutability
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+          VERSION: ${{ needs.validate-release-tag.outputs.version }}
+        run: |
+          for candidate_tag in "$RELEASE_TAG" "$VERSION"; do
+            if git ls-remote --exit-code --tags origin "refs/tags/$candidate_tag" >/dev/null 2>&1; then
+              echo "release version already has a tag: $candidate_tag" >&2
+              exit 1
+            fi
+          done
+
       - name: Download binary artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
