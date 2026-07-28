@@ -144,6 +144,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use hbb_common::tokio;
+    use sqlx::Connection;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -211,8 +212,17 @@ mod tests {
         for job in jobs {
             assert!(job.await.unwrap().unwrap().is_some());
         }
+
+        // Dropping a SqliteConnection only signals its worker thread. Windows
+        // keeps the database files locked until that worker has exited, so
+        // drain the idle pool and await each connection's graceful shutdown
+        // before checking temporary-directory cleanup.
+        let connections = db.pool.retain(|_, _| false).removed;
         db.pool.close();
         drop(db);
+        for connection in connections {
+            connection.close().await.unwrap();
+        }
         let temporary_directory = directory.directory().to_owned();
         drop(directory);
         assert!(!temporary_directory.exists());
