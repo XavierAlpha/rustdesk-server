@@ -9,18 +9,18 @@ Homepage: https://github.com/XavierAlpha/rustdesk-server
 
 Package: rustdesk-server-hbbs
 Architecture: {{ ARCH }}
-Depends: adduser, systemd, ${misc:Depends}, ${shlibs:Depends}
+Depends: adduser, systemd, ${misc:Depends}
 Description: Camellia rendezvous server
  Self-hosted Camellia device discovery and rendezvous service.
 
 Package: rustdesk-server-hbbr
 Architecture: {{ ARCH }}
-Depends: adduser, systemd, ${misc:Depends}, ${shlibs:Depends}
+Depends: adduser, systemd, ${misc:Depends}
 Description: Camellia relay server
  Self-hosted Camellia encrypted connection relay service.
 
 Package: rustdesk-server-utils
 Architecture: {{ ARCH }}
-Depends: ${misc:Depends}, ${shlibs:Depends}
+Depends: ${misc:Depends}
 Description: Camellia server utilities
  Diagnostic and key-management utilities for Camellia servers.

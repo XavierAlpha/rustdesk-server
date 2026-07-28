@@ -6,9 +6,9 @@ usage() {
   cat <<'EOF'
 Usage: debian/build-packages.sh --architecture ARCH --workspace DIRECTORY
 
-Wrap the prebuilt hbbs, hbbr, and rustdesk-utils binaries in the three Debian
-packages declared by this repository. DIRECTORY must already contain a bin/
-directory with those three regular files and must not contain debian/.
+Wrap the prebuilt static hbbs, hbbr, and rustdesk-utils binaries in the three
+Debian packages declared by this repository. DIRECTORY must already contain a
+bin/ directory with those three regular files and must not contain debian/.
 EOF
 }
 
@@ -44,8 +44,10 @@ done
 [[ -n "$architecture" ]] || fail "--architecture is required"
 [[ -n "$workspace" ]] || fail "--workspace is required"
 case "$architecture" in
-  amd64|arm64|armhf|i386)
-    ;;
+  amd64) expected_elf_machine="Advanced Micro Devices X86-64" ;;
+  arm64) expected_elf_machine="AArch64" ;;
+  armhf) expected_elf_machine="ARM" ;;
+  i386) expected_elf_machine="Intel 80386" ;;
   *)
     fail "unsupported Debian architecture: $architecture"
     ;;
@@ -70,6 +72,20 @@ for binary_name in "${binary_names[@]}"; do
   [[ -f "$binary_path" && ! -L "$binary_path" ]] \
     || fail "missing regular, non-symlink binary: $binary_path"
   chmod 0755 "$binary_path"
+
+  elf_header="$(LC_ALL=C readelf --file-header --wide "$binary_path" 2>/dev/null)" \
+    || fail "binary is not a valid ELF file: $binary_path"
+  elf_machine="$(
+    sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p' <<< "$elf_header"
+  )"
+  [[ "$elf_machine" == "$expected_elf_machine" ]] \
+    || fail "binary architecture mismatch for $binary_path: expected $expected_elf_machine, got $elf_machine"
+
+  dynamic_section="$(LC_ALL=C readelf --dynamic --wide "$binary_path" 2>/dev/null)" \
+    || fail "cannot inspect dynamic dependencies: $binary_path"
+  if grep -Fq '(NEEDED)' <<< "$dynamic_section"; then
+    fail "binary has dynamic library dependencies: $binary_path"
+  fi
 done
 
 cp -a -- "$script_dir" "$workspace/debian"
