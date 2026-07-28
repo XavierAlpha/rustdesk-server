@@ -1,32 +1,134 @@
-name: quality
+name: CI
 
 on:
-  workflow_call:
-    inputs:
-      ref:
-        description: Git ref or commit to validate
-        required: false
-        type: string
-        default: ""
   pull_request:
   push:
     branches:
       - master
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: quality-${{ github.workflow }}-${{ inputs.ref || github.ref }}
-  cancel-in-progress: true
+  group: server-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
 
 jobs:
+  classify:
+    name: Classify changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      runtime: ${{ steps.changes.outputs.runtime }}
+      dependencies: ${{ steps.changes.outputs.dependencies }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          runtime=false
+          dependencies=false
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            runtime=true
+          else
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              base="$PR_BASE_SHA"
+              head="$PR_HEAD_SHA"
+            else
+              base="$PUSH_BASE_SHA"
+              head="$PUSH_HEAD_SHA"
+            fi
+            if [[ "$base" =~ ^0+$ ]]; then
+              base="$(git hash-object -t tree /dev/null)"
+            fi
+
+            changed_paths="$RUNNER_TEMP/server-changed-paths"
+            git diff --name-only -z "$base" "$head" > "$changed_paths"
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                README.md|README_EN.md|docs/*|LICENSE|LICENSE.*|.github/ISSUE_TEMPLATE/*)
+                  ;;
+                *)
+                  runtime=true
+                  ;;
+              esac
+              case "$path" in
+                Cargo.toml|Cargo.lock|.gitmodules|libs/hbb_common|docker/Dockerfile|docker-classic/Dockerfile|.github/dependabot.yml|.github/workflows/*)
+                  dependencies=true
+                  ;;
+              esac
+            done < "$changed_paths"
+          fi
+
+          {
+            echo "runtime=$runtime"
+            echo "dependencies=$dependencies"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Change classification"
+            echo
+            echo "- Runtime validation: \`$runtime\`"
+            echo "- Dependency review: \`$dependencies\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  metadata:
+    name: Validate component version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Test and validate release metadata
+        id: release
+        run: |
+          python scripts/test_release_metadata.py
+          python scripts/release_metadata.py --github-output
+
+  dependency_review:
+    name: Review dependency changes
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.classify.outputs.dependencies == 'true'
+    needs: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Review dependency graph delta
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: never
+
   workflow:
     name: Workflow and deployment configuration
+    if: needs.classify.outputs.runtime == 'true'
+    needs: classify
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -35,7 +137,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref || github.ref }}
           submodules: false
 
       - name: Lint GitHub Actions
@@ -143,6 +244,8 @@ jobs:
 
   rust:
     name: Rust quality gates
+    if: needs.classify.outputs.runtime == 'true'
+    needs: classify
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -151,7 +254,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref || github.ref }}
           submodules: recursive
 
       - name: Install Rust toolchain
@@ -204,6 +306,8 @@ jobs:
 
   windows:
     name: Windows compile and tests
+    if: needs.classify.outputs.runtime == 'true'
+    needs: classify
     runs-on: windows-2025
     timeout-minutes: 30
 
@@ -212,7 +316,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref || github.ref }}
           submodules: recursive
 
       - name: Install Rust toolchain
@@ -230,3 +333,53 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --locked --workspace --all-features
+
+  required:
+    name: CI / Required
+    if: always()
+    needs:
+      - classify
+      - metadata
+      - dependency_review
+      - workflow
+      - rust
+      - windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce required results
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUNTIME_REQUIRED: ${{ needs.classify.outputs.runtime }}
+          DEPENDENCIES_CHANGED: ${{ needs.classify.outputs.dependencies }}
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          METADATA_RESULT: ${{ needs.metadata.result }}
+          DEPENDENCY_REVIEW_RESULT: ${{ needs.dependency_review.result }}
+          WORKFLOW_RESULT: ${{ needs.workflow.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+        run: |
+          failure=false
+          require_success() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "$name must succeed, got: $result" >&2
+              failure=true
+            fi
+          }
+
+          require_success "change classification" "$CLASSIFY_RESULT"
+          require_success "component version validation" "$METADATA_RESULT"
+          if [[ "$RUNTIME_REQUIRED" == "true" ]]; then
+            require_success "workflow and deployment validation" "$WORKFLOW_RESULT"
+            require_success "Rust quality" "$RUST_RESULT"
+            require_success "Windows validation" "$WINDOWS_RESULT"
+          fi
+          if [[ "$EVENT_NAME" == "pull_request" && "$DEPENDENCIES_CHANGED" == "true" ]]; then
+            require_success "dependency review" "$DEPENDENCY_REVIEW_RESULT"
+          fi
+          if [[ "$failure" == "true" ]]; then
+            exit 1
+          fi
